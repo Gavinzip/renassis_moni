@@ -28,13 +28,17 @@
 雖然抓取價格是免費的，但當監控器發現一張標題模糊的「新卡片」時，需要 AI 大腦去識別圖片或標題。這是為了確保搜尋關鍵字正確，避免抓錯價格。
 
 ### 2. 快速啟動
-切換至目錄並設定 Discord Webhook 網址：
+切換至目錄並設定環境變數：
 
 ```bash
-# 設定 Discord Webhook 網址 (必填，用於接收警報)
+# 1. 警報接收 (必填)
 export DISCORD_WEBHOOK_URL="你的_WEBHOOK_網址"
 
-# 安裝依賴並背景啟動
+# 2. 自定義監控參數 (選填)
+export WINDOW_DAYS=30        # 均價計算時間範圍 (預設 30 天)
+export PRICE_THRESHOLD=30.0  # 觸發警報的價差門檻 (預設 $30 USD)
+
+# 背景啟動
 python3 -m pip install -r requirements.txt
 nohup python3 -u market_monitor.py > market_monitor.log 2>&1 &
 ```

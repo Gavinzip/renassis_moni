@@ -10,6 +10,9 @@ import sys
 import market_report_vision as mrv
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+# 🆕 加入可條整參數
+WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", 30))
+PRICE_THRESHOLD = float(os.getenv("PRICE_THRESHOLD", 30))
 
 def parse_date_string(date_str):
     """解析 PC 和 SNKR 的各種日期格式，返回 datetime 對象"""
@@ -108,6 +111,11 @@ def calculate_source_average(records, target_grade, window_days=30):
         
     avg = sum(prices_to_use) / len(prices_to_use)
     return avg, len(all_prices)
+def calculate_true_average_with_window(pc_records, snkr_records, target_grade):
+    """(兼容舊版或輔助調用) 使用全局設定的天數計算均價"""
+    pc_avg, pc_count = calculate_source_average(pc_records, target_grade, window_days=WINDOW_DAYS)
+    snkr_avg, snkr_count = calculate_source_average(snkr_records, target_grade, window_days=WINDOW_DAYS)
+    return (pc_avg, pc_count), (snkr_avg, snkr_count)
 def parse_renaiss_name(full_name):
     grade_m = re.search(r'(PSA|BGS|CGC|SGC)\s+(\d+(?:\.\d+)?)', full_name)
     grade_tag = f"{grade_m.group(1)} {grade_m.group(2)}" if grade_m else "Unknown"
@@ -222,7 +230,7 @@ def fetch_and_analyze_realtime(item_id, full_name, grading_company, year):
         name=card_name, number=number, set_code=set_code,
         target_grade=grade_tag, is_alt_art=is_alt_art, category=category
     )
-    pc_avg, pc_count = calculate_source_average(pc_records, grade_tag, window_days=30)
+    pc_avg, pc_count = calculate_source_average(pc_records, grade_tag, window_days=WINDOW_DAYS)
     
     # 執行 SNKR 搜尋與計算
     snkr_records, _, snkr_url = mrv.search_snkrdunk(
@@ -230,7 +238,7 @@ def fetch_and_analyze_realtime(item_id, full_name, grading_company, year):
         target_grade=grade_tag, is_alt_art=is_alt_art, card_language="JP" if is_jp else "EN",
         snkr_variant_kws=snkr_variants
     )
-    snkr_avg, snkr_count = calculate_source_average(snkr_records, grade_tag, window_days=30)
+    snkr_avg, snkr_count = calculate_source_average(snkr_records, grade_tag, window_days=WINDOW_DAYS)
     
     return (pc_avg, pc_count, pc_url), (snkr_avg, snkr_count, snkr_url)
 
@@ -257,7 +265,7 @@ def send_discord_alert(full_name, ask, pc_info, snkr_info):
         "content": f"🚨 **[真正撿漏警報]** {full_name}",
         "embeds": [
             {
-                "title": f"發現套利機會！(觸發門檻: $30)",
+                "title": f"發現套利機會！(觸發門檻: ${PRICE_THRESHOLD})",
                 "color": 16711680,  # Red
                 "fields": fields,
                 "description": f"[🔗 PriceCharting]({pc_url or 'https://www.pricecharting.com'})\n[🔗 SNKRDUNK]({snkr_url or 'https://snkrdunk.com'})"
@@ -295,14 +303,14 @@ def run_monitor_cycle():
         snkr_avg, snkr_count, snkr_url = snkr_res
         
         # 2. 獨立判斷折扣 (只要其中一個來源符合就報警)
-        alert_pc = (pc_avg and (pc_avg - ask) >= 30)
-        alert_snkr = (snkr_avg and (snkr_avg - ask) >= 30)
+        alert_pc = (pc_avg and (pc_avg - ask) >= PRICE_THRESHOLD)
+        alert_snkr = (snkr_avg and (snkr_avg - ask) >= PRICE_THRESHOLD)
         
         # 日誌輸出
         log_parts = []
-        if pc_avg: log_parts.append(f"PC(30d): ${pc_avg:.2f}")
-        if snkr_avg: log_parts.append(f"SNKR(30d): ${snkr_avg:.2f}")
-        print(f"  [掃描中] {full_name} | Ask: ${ask:.2f} | {' / '.join(log_parts) if log_parts else '無30天內數據'}")
+        if pc_avg: log_parts.append(f"PC({WINDOW_DAYS}d): ${pc_avg:.2f}")
+        if snkr_avg: log_parts.append(f"SNKR({WINDOW_DAYS}d): ${snkr_avg:.2f}")
+        print(f"  [掃描中] {full_name} | Ask: ${ask:.2f} | {' / '.join(log_parts) if log_parts else f'無{WINDOW_DAYS}天內數據'}")
 
         if alert_pc or alert_snkr:
             triggered_by = []
@@ -311,7 +319,7 @@ def run_monitor_cycle():
             
             print(f"\n🚨 [真正撿漏警報] {full_name}")
             print(f"   => 賣家開價: ${ask:.2f} USD")
-            print(f"   🔥 觸發來源: {' & '.join(triggered_by)}！請立刻注意把這張卡買下來！\n")
+            print(f"   🔥 觸發來源: {' & '.join(triggered_by)}！(門檻: ${PRICE_THRESHOLD}, 窗口: {WINDOW_DAYS}天) 請立刻注意把這張卡買下來！\n")
             
             # 發送 Discord Webhook
             send_discord_alert(full_name, ask, pc_res, snkr_res)
@@ -319,6 +327,8 @@ def run_monitor_cycle():
 
 if __name__ == "__main__":
     print("啟動 Renaiss 極致「全實時」監控機器人 (現場抓取分析模式)...")
+    print(f"⚙️  當前設定: 價差門檻=${PRICE_THRESHOLD} USD | 時間窗口={WINDOW_DAYS} 天")
+    print(f"🔔  Discord 通知: {'已開啟' if DISCORD_WEBHOOK_URL else '未開啟 (請設定 DISCORD_WEBHOOK_URL)'}")
     
     while True:
         try:
