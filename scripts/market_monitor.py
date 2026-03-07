@@ -385,6 +385,7 @@ if __name__ == "__main__":
 
     while True:
         try:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔃 正在掃描市場新掛單...")
             run_monitor_cycle()
         except Exception as e:
             print(f"Monitor Crash: {e}")
