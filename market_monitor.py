@@ -1,7 +1,6 @@
 import requests
 import re
 import json
-import sqlite3
 import time
 from datetime import datetime, timedelta
 import os
@@ -10,41 +9,7 @@ import sys
 # Import search functions locally
 import market_report_vision as mrv
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "renaiss_full_db.sqlite")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
-
-def init_db():
-    """初始化資料庫架構 (如果不存在)"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS cards (
-            item_id TEXT PRIMARY KEY,
-            name TEXT,
-            number TEXT,
-            set_code TEXT,
-            grade TEXT,
-            grading_company TEXT,
-            year INTEGER,
-            pack_name TEXT,
-            buyback_usd REAL,
-            pc_url TEXT,
-            snkr_url TEXT,
-            last_updated TEXT
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS price_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_id TEXT,
-            source TEXT,
-            date TEXT,
-            price_usd REAL,
-            grade TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
 
 # Rename the parse function so it can be used standalone or from scrape_all_cards_db
 def parse_renaiss_name(full_name):
@@ -214,29 +179,6 @@ def fetch_and_analyze_realtime(item_id, full_name, grading_company, year):
     # Calculate Real-Time Average
     true_avg, history_count = calculate_true_average(pc_records, snkr_records, grade_tag)
     
-    # Save to DB for historical tracking
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute('''
-            INSERT OR REPLACE INTO cards (item_id, name, number, set_code, grade, grading_company, year, pack_name, buyback_usd, pc_url, snkr_url, last_updated)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,datetime('now', 'localtime'))
-        ''', (item_id, full_name, number, set_code, grade_tag, grading_company, year, "unknown", 0.0, pc_url, snkr_url))
-        
-        c.execute('DELETE FROM price_history WHERE item_id = ?', (item_id,))
-        for r in (pc_records or []):
-            if r.get('grade'):
-                c.execute('INSERT INTO price_history (item_id,source,date,price_usd,grade) VALUES (?,?,?,?,?)',
-                          (item_id, 'PriceCharting', r.get('date',''), r.get('price', 0), r['grade']))
-        for r in (snkr_records or []):
-            if r.get('grade'):
-                c.execute('INSERT INTO price_history (item_id,source,date,price_usd,grade) VALUES (?,?,?,?,?)',
-                          (item_id, 'SNKRDUNK', r.get('date',''), r.get('price', 0), r['grade']))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"  ⚠️ DB Logging failed: {e}")
-
     return true_avg, history_count
 
 
@@ -313,7 +255,6 @@ def run_monitor_cycle():
 
 if __name__ == "__main__":
     print("啟動 Renaiss 極致「全實時」監控機器人 (現場抓取分析模式)...")
-    init_db()  # 確保資料庫架構已備妥
     
     while True:
         try:
