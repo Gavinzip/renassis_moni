@@ -14,6 +14,9 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", 30))
 PRICE_THRESHOLD = float(os.getenv("PRICE_THRESHOLD", 20))
 
+# 📦 狀態管理：追蹤已處理過的掛單 ID
+SEEN_IDS = set()
+
 def parse_date_string(date_str):
     """解析 PC 和 SNKR 的各種日期格式，返回 datetime 對象"""
     now = datetime.now()
@@ -281,16 +284,30 @@ def send_discord_alert(full_name, ask, pc_info, snkr_info):
 # LEGACY: background_idle_update removed for real-time focus
 
 
-def run_monitor_cycle(limit=None):
+def run_monitor_cycle(limit=None, force_process=False):
+    """
+    監控循環：
+    - limit: 限制處理筆數 (用於啟動測試)
+    - force_process: 是否忽略 SEEN_IDS 檢查 (用於啟動測試)
+    """
     items = fetch_market_data()
     if not items:
         return
         
     if limit:
         items = items[:limit]
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🧪 啟動測試模式：僅檢查前 {limit} 筆掛單...")
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🧪 測試模式：僅檢查前 {limit} 筆掛單...")
+    
+    # 過濾已見過的 ID (除非強制處理)
+    if not force_process:
+        new_items = [it for it in items if it['item_id'] not in SEEN_IDS]
+        if not new_items:
+            return # 沒有新品，直接結束
+        items = new_items
+        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] ✨ 發現 {len(items)} 筆新品上架，開始查價...")
     else:
-        print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 成功抓取 {len(items)} 筆目前市場掛單，開始進行逐一實時查價...")
+        if not limit:
+            print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 成功抓取 {len(items)} 筆掛單進行完全查價...")
     
     for item in items:
         item_id = item['item_id']
@@ -327,6 +344,9 @@ def run_monitor_cycle(limit=None):
             
             # 發送 Discord Webhook
             send_discord_alert(full_name, ask, pc_res, snkr_res)
+        
+        # 標記為已見過
+        SEEN_IDS.add(item_id)
 
 
 if __name__ == "__main__":
