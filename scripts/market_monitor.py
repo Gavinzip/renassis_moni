@@ -23,7 +23,7 @@ DEFAULT_PRICE_THRESHOLD = 20.0                  # 報警價差門檻 (USD)
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") or DEFAULT_DISCORD_WEBHOOK
 WINDOW_DAYS = int(os.getenv("WINDOW_DAYS") or DEFAULT_WINDOW_DAYS)
-PRICE_THRESHOLD = abs(float(os.getenv("PRICE_THRESHOLD") or DEFAULT_PRICE_THRESHOLD))
+PRICE_THRESHOLD = float(os.getenv("PRICE_THRESHOLD") or DEFAULT_PRICE_THRESHOLD)
 
 # 📦 狀態管理：追蹤已處理過的掛單 ID
 SEEN_IDS_FILE = os.path.join(os.path.dirname(__file__), "seen_ids.txt")
