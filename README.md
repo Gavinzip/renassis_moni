@@ -28,15 +28,14 @@
 雖然抓取價格是免費的，但當監控器發現一張標題模糊的「新卡片」時，需要 AI 大腦去識別圖片或標題。這是為了確保搜尋關鍵字正確，避免抓錯價格。
 
 ### 2. 快速啟動
-切換至目錄並設定環境變數：
+切換至目錄並設定環境變數（建議使用 `.env` 檔案）：
 
 ```bash
-# 1. 警報接收 (必填)
-export DISCORD_WEBHOOK_URL="你的_WEBHOOK_網址"
+# 複製範例設定檔
+cp .env.example .env
 
-# 2. 自定義監控參數 (選填)
-export WINDOW_DAYS=30        # 均價計算時間範圍 (預設 30 天)
-export PRICE_THRESHOLD=30.0  # 觸發警報的價差門檻 (預設 $30 USD)
+# 編輯 .env 填入你的 Webhook 與參數
+# nano .env 
 
 # 背景啟動
 python3 -m pip install -r requirements.txt
@@ -48,7 +47,7 @@ nohup python3 -u market_monitor.py > market_monitor.log 2>&1 &
 ## 🔔 警報機制
 
 ### Discord 即時推送
-當系統發現 **「市場均價 - 賣家開價 ≥ $30 USD」** 時，會立刻發送精美的 Embed 訊息到 Discord，包含：
+當系統發現 **「市場均價 - 賣家開價 ≥ $20 USD」** 時，會立刻發送精美的 Embed 訊息到 Discord，包含：
 - 卡片名稱、等級
 - 賣家開價 vs 市場真實均價
 - 直接跳轉到比價平台的連結

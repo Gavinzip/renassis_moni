@@ -8,6 +8,10 @@ import sys
 
 # Import search functions locally
 import market_report_vision as mrv
+from dotenv import load_dotenv
+
+# 📜 載入 .env 檔案
+load_dotenv()
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 # 🆕 加入可條整參數
