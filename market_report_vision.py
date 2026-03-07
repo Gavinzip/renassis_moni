@@ -1,0 +1,1433 @@
+import argparse
+import asyncio
+import subprocess
+import re
+import requests
+import json
+import time
+import urllib.parse
+import concurrent.futures
+import os
+import base64
+import threading
+import tempfile
+from collections import deque
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+import contextvars
+
+load_dotenv()
+
+REPORT_ONLY = False
+# Use ContextVar for thread-safe per-task debug directory
+_debug_dir_var = contextvars.ContextVar('DEBUG_DIR', default=None)
+
+def _get_debug_dir():
+    return _debug_dir_var.get()
+
+def _set_debug_dir(path):
+    _debug_dir_var.set(path)
+
+_notify_msgs_var = contextvars.ContextVar('NOTIFY_MSGS', default=None)
+
+def _push_notify(msg):
+    lst = _notify_msgs_var.get()
+    if lst is not None:
+        lst.append(msg)
+
+def get_and_clear_notify_msgs():
+    lst = _notify_msgs_var.get()
+    if lst:
+        msgs = list(lst)
+        lst.clear()
+        return msgs
+    return []
+
+def _debug_save(filename, content):
+    """Debug 輔助函數：將內容存入 DEBUG_DIR/filename（若 DEBUG_DIR 已設定）"""
+    debug_dir = _get_debug_dir()
+    if not debug_dir:
+        return
+    os.makedirs(debug_dir, exist_ok=True)
+    filepath = os.path.join(debug_dir, filename)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(content)
+    _original_print(f"  💾 [DEBUG] 存檔: {filepath}")
+
+def _debug_log(msg):
+    """Debug log 輔助函數：將訊息 append 到 DEBUG_DIR/debug_log.txt"""
+    debug_dir = _get_debug_dir()
+    if not debug_dir:
+        return
+    os.makedirs(debug_dir, exist_ok=True)
+    timestamp = time.strftime('%H:%M:%S')
+    line = f"[{timestamp}] {msg}\n"
+    _original_print(f"  📍 [DEBUG] {msg}")
+    with open(os.path.join(debug_dir, 'debug_log.txt'), 'a', encoding='utf-8') as f:
+        f.write(line)
+
+def _debug_step(source: str, step_num: int, query: str, url: str,
+                status: str, candidate_urls: list = None,
+                selected_url: str = None, reason: str = "",
+                extra: dict = None):
+    """
+    結構化 Debug Trace — 每次搜尋動作都記錄一筆 JSON 到 debug_trace.jsonl
+    """
+    debug_dir = _get_debug_dir()
+    if not debug_dir:
+        return
+    os.makedirs(debug_dir, exist_ok=True)
+    record = {
+        "time": time.strftime('%H:%M:%S'),
+        "source": source,
+        "step": step_num,
+        "query": query,
+        "url": url,
+        "status": status,
+        "candidate_urls": candidate_urls or [],
+        "selected_url": selected_url or "",
+        "reason": reason,
+    }
+    if extra:
+        record.update(extra)
+    # 即時 print 到 terminal
+    icon = "✅" if status == "OK" else "❌"
+    _original_print(f"  {icon} [{source} Step {step_num}] query={query!r}")
+    _original_print(f"       URL  : {url}")
+    _original_print(f"       狀態 : {status}  —  {reason}")
+    if candidate_urls:
+        _original_print(f"       候選 URLs ({len(candidate_urls)} 筆):")
+        for u in candidate_urls:
+            _original_print(f"         • {u}")
+    if selected_url:
+        _original_print(f"       選定 URL : {selected_url}")
+    # append 到 JSONL
+    with open(os.path.join(debug_dir, 'debug_trace.jsonl'), 'a', encoding='utf-8') as f:
+        f.write(json.dumps(record, ensure_ascii=False) + '\n')
+
+_original_print = print
+def print(*args, **kwargs):
+    if REPORT_ONLY and not kwargs.get('force', False):
+        return
+    if 'force' in kwargs:
+        del kwargs['force']
+    _original_print(*args, **kwargs)
+
+_jina_requests_queue = deque()
+_jina_lock = threading.Lock()
+
+def fetch_jina_markdown(target_url):
+    global _jina_requests_queue
+    
+    # Rate Limiter: 18 requests per 60 seconds (1 minute)
+    MAX_REQUESTS = 18
+    WINDOW_SIZE = 60.0
+    
+    sleep_time = 0
+    with _jina_lock:
+        now = time.time()
+        # Remove requests older than 60 seconds
+        while _jina_requests_queue and now - _jina_requests_queue[0] > WINDOW_SIZE:
+            _jina_requests_queue.popleft()
+            
+        if len(_jina_requests_queue) >= MAX_REQUESTS:
+            # Calculate sleep time required to let the oldest request expire
+            sleep_time = WINDOW_SIZE - (now - _jina_requests_queue[0])
+            
+    if sleep_time > 0:
+        print(f"⏳ Jina API rate limit approaching ({MAX_REQUESTS}/min). Pausing for {sleep_time:.1f} seconds to cool down...")
+        time.sleep(sleep_time)
+        
+    with _jina_lock:
+        now = time.time()
+        # Clean up again
+        while _jina_requests_queue and now - _jina_requests_queue[0] > WINDOW_SIZE:
+            _jina_requests_queue.popleft()
+        _jina_requests_queue.append(now)
+
+    print(f"Fetching: {target_url}...")
+    jina_url = f"https://r.jina.ai/{target_url}"
+    
+    for attempt in range(3):
+        try:
+            response = requests.get(jina_url, timeout=60)
+            if response.status_code == 429:
+                print(f"⚠️ Jina 發生 429 頻率限制 (嘗試 {attempt+1}/3). 暫停 1 秒後重試...")
+                time.sleep(1)
+                continue
+                
+            response.raise_for_status()
+            return response.text
+            
+        except requests.exceptions.RequestException as e:
+            if hasattr(e, 'response') and e.response is not None and e.response.status_code == 429:
+                print(f"⚠️ Jina 發生 429 頻率限制 (嘗試 {attempt+1}/3). 暫停 1 秒後重試...")
+                time.sleep(1)
+                continue
+                
+            print(f"Fetch error for {target_url}: {e}")
+            return ""
+            
+    return ""
+
+def get_exchange_rate():
+    try:
+        resp = requests.get("https://open.er-api.com/v6/latest/USD")
+        data = resp.json()
+        return data['rates']['JPY']
+    except:
+        return 150.0
+
+def _fetch_pc_prices_from_url(product_url, md_content=None, skip_hi_res=False, target_grade="PSA 10"):
+    """
+    Given a PriceCharting product URL, fetch (if md_content is None) and parse it.
+    Returns (records, resolved_url, pc_img_url).
+    """
+    if not md_content:
+        md_content = fetch_jina_markdown(product_url)
+    
+    if not md_content:
+        print(f"DEBUG: Failed to get markdown for {product_url}")
+        return [], product_url, None
+
+    print(f"DEBUG: Parsing PriceCharting page: {product_url} (length: {len(md_content)})")
+
+    lines = md_content.split('\n')
+    records = []
+    
+    # Parser 1: 嘗試原本的 Markdown Table 格式 (每行有 | 分隔)
+    date_regex_md = r'\|\s*(\d{4}-\d{2}-\d{2}|[A-Z][a-z]{2}\s\d{1,2},\s\d{4})\s*\|'
+    for line in lines:
+        if re.search(date_regex_md, line):
+            parts = [p.strip() for p in line.split('|')]
+            if len(parts) >= 5:
+                date_str = parts[1]
+                all_prices = re.findall(r'\$([\d,]+\.\d{2})', line)
+                if not all_prices: continue
+                real_prices = [p for p in all_prices if p not in ('6.00',)]
+                if not real_prices: continue
+                
+                price_usd = float(real_prices[-1].replace(',', ''))
+                title_clean = line.replace(" ", "").lower()
+                
+                detected_grade = None
+                if re.search(r'(psa|cgc|bgs|grade|gem)10', title_clean) or ("psa" in title_clean and "10" in title_clean):
+                    detected_grade = "PSA 10"
+                elif re.search(r'bgs\s*9\.5', title_clean):
+                    detected_grade = "BGS 9.5"
+                elif re.search(r'(psa|cgc|bgs|grade|gem)9', title_clean) or ("psa" in title_clean and "9" in title_clean):
+                    detected_grade = "PSA 9"
+                elif re.search(r'(psa|cgc|bgs|grade|gem)8', title_clean) or ("psa" in title_clean and "8" in title_clean):
+                    detected_grade = "PSA 8"
+                elif not re.search(r'(psa|bgs|cgc|grade|gem)', title_clean):
+                    detected_grade = "Ungraded"
+                        
+                if detected_grade:
+                    records.append({
+                        "date": date_str,
+                        "price": price_usd,
+                        "grade": detected_grade
+                    })
+
+    # Parser 2: 嘗試 Jina 新版的 TSV 格式 (日期獨立一行，標題與價格在下一行)
+    if not records:
+        current_date = None
+        date_regex_tsv = r'^(\d{4}-\d{2}-\d.2}|[A-Z][a-z]{2}\s\d{1,2},\s\d{4})'
+        for line in lines:
+            line = line.strip()
+            date_match = re.match(date_regex_tsv, line)
+            if date_match:
+                current_date = date_match.group(1)
+                continue
+            if current_date and "$" in line:
+                all_prices = re.findall(r'\$([\d,]+\.\d{2})', line)
+                if not all_prices: continue
+                real_prices = [p for p in all_prices if p not in ('6.00',)]
+                if not real_prices: continue
+                price_usd = float(real_prices[-1].replace(',', ''))
+                title_clean = line.replace(" ", "").lower()
+                detected_grade = None
+                if re.search(r'(psa|cgc|bgs|grade|gem)10', title_clean) or ("psa" in title_clean and "10" in title_clean):
+                    detected_grade = "PSA 10"
+                elif re.search(r'bgs\s*9\.5', title_clean):
+                    detected_grade = "BGS 9.5"
+                elif re.search(r'(psa|cgc|bgs|grade|gem)9', title_clean) or ("psa" in title_clean and "9" in title_clean):
+                    detected_grade = "PSA 9"
+                elif not re.search(r'(psa|bgs|cgc|grade|gem)', title_clean):
+                    detected_grade = "Ungraded"
+                if detected_grade:
+                    records.append({
+                        "date": current_date,
+                        "price": price_usd,
+                        "grade": detected_grade
+                    })
+
+    # Summary: if no per-item records, try summary table
+    today_str = datetime.now().strftime('%Y-%m-%d')
+    grade_summary_map = {'Ungraded': 'Ungraded', 'PSA 10': 'PSA 10', 'PSA 9': 'PSA 9', 'BGS 9.5': 'BGS 9.5'}
+    existing_grades = set(r['grade'] for r in records)
+    for line in lines:
+        for grade_label, grade_key in grade_summary_map.items():
+            label_nospace = grade_label.replace(' ', '')
+            if re.match(rf'^{re.escape(label_nospace)}\$[\d,]+\.\d{{2}}$', line.replace(' ', '')):
+                if grade_key not in existing_grades:
+                    price_match = re.search(r'\$[\d,]+\.\d{2}', line)
+                    if price_match:
+                        price_usd = extract_price(price_match.group(0))
+                        records.append({"date": today_str, "price": price_usd, "grade": grade_key, "note": "PC avg price"})
+
+    records.sort(key=lambda x: x['date'], reverse=True)
+    
+    pc_img_url = None
+    img_patterns = [
+        r'!\[.*?\]\((https://storage\.googleapis\.com/images\.pricecharting\.com/[^/)]+/\d+\.jpg)\)',
+        r'!\[.*?\]\((https://product-images\.s3\.amazonaws\.com/[^\)]+)\)',
+        r'!\[.*?\]\((https://images\.pricecharting\.com/[^\)]+)\)',
+        r'!\[.*?\]\((https://[^)]+?pricecharting\.com/[^)]+?\.(?:jpg|png|webp)[^)]*)\)',
+        r'!\[.*?\]\((https://[^)]+?\.(?:jpg|png|webp)[^)]*)\)',
+    ]
+    for pat in img_patterns:
+        m = re.search(pat, md_content)
+        if m:
+            pc_img_url = m.group(1)
+            if not skip_hi_res:
+                hiRes_url = re.sub(r'/([\d]+)\.jpg$', '/1600.jpg', pc_img_url)
+                if hiRes_url != pc_img_url:
+                    try:
+                        if requests.head(hiRes_url, timeout=5).status_code == 200:
+                            pc_img_url = hiRes_url
+                    except: pass
+            break
+
+    return records, product_url, pc_img_url
+
+def extract_price(price_str):
+    cleaned = re.sub(r'[^\d.]', '', price_str)
+    try:
+        return float(cleaned)
+    except:
+        return 0.0
+
+def search_pricecharting(name, number, set_code, target_grade, is_alt_art, category="Pokemon", is_flagship=False, return_candidates=False):
+    # Basic Name cleaning (strip parentheses like "Queen (Flagship Battle Top 8 Prize)")
+    name_query = re.sub(r'\(.*?\)', '', name).strip()
+    
+    # Improve number extraction for One Piece (ST04-005 -> 005)
+    # If the number contains a dash and follows OP format, take the part after the dash
+    if '-' in number and re.search(r'[A-Z]+\d+-\d+', number):
+        number_clean = number.split('-')[-1].lstrip('0')
+    else:
+        _num_parts = number.split('/')
+        _num_raw = _num_parts[0].strip()
+        _digits_only = re.search(r'\d+', _num_raw)
+        number_clean = _digits_only.group(0).lstrip('0') if _digits_only else _num_raw.lstrip('0')
+    
+    if not number_clean: number_clean = '0'
+    
+    # Try to extract suffix like SM-P from the number itself if it's there
+    suffix = ""
+    _num_parts = number.split('/')
+    if len(_num_parts) > 1:
+        potential_suffix = _num_parts[1].strip()
+        if re.search(r'(SM-P|S-P|SV-P|SV-G|S8a-G)', potential_suffix, re.IGNORECASE):
+            suffix = potential_suffix
+    
+    # Try with set code or suffix first
+    queries_to_try = []
+    final_set_code = set_code if set_code else suffix
+    
+    if final_set_code:
+        queries_to_try.append(f"{name_query} {final_set_code} {number_clean}".replace(" ", "+"))
+    
+    queries_to_try.append(f"{name_query} {number_clean}".replace(" ", "+"))
+
+    is_one_piece = category.lower() == "one piece"
+    _debug_log(f"PriceCharting: 類別={category} ({'航海王模式' if is_one_piece else '寶可夢模式'})，共 {len(queries_to_try)} 種查詢方案: {queries_to_try}")
+
+    md_content = ""
+    search_url = ""
+    pc_step = 0
+
+    for query in queries_to_try:
+        pc_step += 1
+        search_url = f"https://www.pricecharting.com/search-products?q={query}&type=prices"
+        _debug_log(f"PriceCharting Step {pc_step}: 查詢={query!r}  URL={search_url}")
+        md_content = fetch_jina_markdown(search_url)
+        if md_content and ("Search Results" in md_content or "Your search for" in md_content):
+            _debug_step("PriceCharting", pc_step, query, search_url,
+                        "OK", reason="搜尋頁面有多筆結果，繼續解析")
+            break
+        elif md_content and "PriceCharting" in md_content:
+            _debug_step("PriceCharting", pc_step, query, search_url,
+                        "OK", reason="直接落在商品頁面")
+            break
+        else:
+            _debug_step("PriceCharting", pc_step, query, search_url,
+                        "NO_RESULTS", reason="頁面為空或無法識別，嘗試下一個查詢")
+            
+    if not md_content:
+        _debug_step("PriceCharting", pc_step, "", "",
+                    "ERROR", reason="所有查詢均無回應，放棄")
+        return None, None, None
+    
+    product_url = ""
+    if "Your search for" in md_content or "Search Results" in md_content:
+        urls = re.findall(r'(https://www\.pricecharting\.com/game/[^/]+/[^" )\]]+)', md_content)
+        # Deduplicate while preserving order
+        urls = list(dict.fromkeys(urls))
+        
+        _debug_log(f"PriceCharting: 從搜尋頁面提取到 {len(urls)} 個候選 URL")
+        
+        valid_urls = []
+        # 「名稱 slug」用純角色名（去掉括號內的版本描述，如 Leader Parallel / SP Foil 等）
+        name_for_slug = re.sub(r'\(.*?\)', '', name).strip()
+        name_slug = re.sub(r'[^a-zA-Z0-9]', '-', name_for_slug.lower()).strip('-')
+        # 編號的 0-padded 3位形式，修復 URL slug 內 026 不能被 26 regex 匹配的問題
+        number_padded_pc = number_clean.zfill(3)
+        # 航海王模式：set_code slug 用來做額外驗證 (e.g. "OP02" -> "op02")
+        set_code_slug = re.sub(r'[^a-zA-Z0-9]', '', set_code).lower() if set_code else ""
+
+        def _num_match(slug):
+            """編號匹配：接受去前導0 或 3位補齊兩種形式"""
+            return (bool(re.search(rf'(?<!\d){number_clean}(?!\d)', slug))
+                    or number_padded_pc in slug)
+
+        def _set_match(slug):
+            """set_code 匹配：URL slug 含有 set_code 的核心字母數字部分"""
+            return bool(set_code_slug) and set_code_slug in slug.replace('-', '')
+
+        matching_both = []   # 名稱 + 編號 (+ set_code for OP)
+        matching_name = []   # 只有名稱 (+ set_code for OP)
+        matching_number = [] # 只有編號 (+ set_code for OP)
+
+        for u in urls:
+            u_end = u.split('/')[-1].lower()
+
+            if is_one_piece:
+                # ── 航海王模式：必須包含 set_code，再依名稱/編號分級 ──
+                has_set = _set_match(u_end)
+                has_num = _num_match(u_end)
+                has_name = bool(name_slug) and name_slug in u_end
+
+                if has_name and has_num and has_set:
+                    matching_both.append(u)
+                    _debug_log(f"  ✅ [OP] 名稱+編號+setcode: {u}")
+                elif has_name and has_set:
+                    matching_name.append(u)
+                    _debug_log(f"  🔶 [OP] 名稱+setcode (無編號): {u}")
+                elif has_num and has_set:
+                    matching_number.append(u)
+                    _debug_log(f"  🔷 [OP] 編號+setcode (無名稱): {u}")
+                elif has_name and has_num:
+                    matching_both.append(u)
+                    _debug_log(f"  🟡 [OP] 名稱+編號 (setcode未命中): {u}")
+                else:
+                    _debug_log(f"  ❌ [OP] URL 不符合: {u}")
+            else:
+                if name_slug and name_slug in u_end and _num_match(u_end):
+                    matching_both.append(u)
+                    _debug_log(f"  ✅ [PKM] 名稱+編號: {u}")
+                elif name_slug and name_slug in u_end:
+                    matching_name.append(u)
+                    _debug_log(f"  🔶 [PKM] 只符合名稱: {u}")
+                elif _num_match(u_end):
+                    matching_number.append(u)
+                    _debug_log(f"  🔷 [PKM] 只符合編號 '{number_clean}'/'{number_padded_pc}': {u}")
+                else:
+                    _debug_log(f"  ❌ [PKM] URL 不符合: {u}")
+
+        # 合併：最高優先為同時符合的，依序遞減
+        valid_urls = matching_both + matching_name + matching_number
+        
+        if return_candidates:
+            return valid_urls, None, None
+                
+        if not valid_urls:
+            _debug_step("PriceCharting", pc_step + 1,
+                        f"name_slug={name_slug!r}, number={number_clean!r}",
+                        search_url, "NO_MATCH",
+                        candidate_urls=urls,
+                        reason=f"所有 {len(urls)} 個候選 URL 均不符合卡片名稱或編號，放棄")
+            print(f"DEBUG: No PC product URL matched the card name '{name}' or number '{number_clean}'.")
+            return None, None, None
+            
+        # Prioritize the first valid match
+        product_url = valid_urls[0]
+        selection_reason = "Default (First match)"
+        
+        # Filter based on is_flagship / is_alt_art (features-based override 主導)
+        if is_flagship:
+            # 旗艦賽獎品卡：尋找包含 flagship 的 URL
+            for u in valid_urls:
+                lower_u = u.replace('[', '').replace(']', '').lower()
+                if "flagship" in lower_u:
+                    product_url = u
+                    selection_reason = "Flagship Filter (偵測到 Flagship Battle 關鍵字)"
+                    break
+        elif is_alt_art:
+            for u in valid_urls:
+                lower_u = u.replace('[', '').replace(']', '').lower()
+                # 航海王異圖版優先尋找包含這些關鍵字的
+                if "manga" in lower_u or "alternate-art" in lower_u or "-sp" in lower_u:
+                    product_url = u
+                    selection_reason = "Alt-Art Filter (偵測到 Manga/Alternate-Art/SP 關鍵字)"
+                    break
+        
+        _debug_step("PriceCharting", pc_step + 1,
+                    f"is_alt_art={is_alt_art}, name_slug={name_slug!r}, number={number_clean!r}",
+                    search_url, "OK",
+                    candidate_urls=urls,
+                    selected_url=product_url,
+                    reason=selection_reason,
+                    extra={"matching_both": matching_both,
+                           "matching_name": matching_name,
+                           "matching_number": matching_number})
+        print(f"DEBUG: Selected PC product URL: {product_url} ({selection_reason})")
+        records, resolved_url, pc_img_url = _fetch_pc_prices_from_url(product_url, target_grade=target_grade)
+    else:
+        print(f"DEBUG: Landed directly on PC product page")
+        product_url = search_url
+        _debug_step("PriceCharting", pc_step + 1, "", product_url,
+                    "OK", reason="直接落在商品頁面，跳過 URL 篩選")
+        records, resolved_url, pc_img_url = _fetch_pc_prices_from_url(product_url, md_content=md_content, target_grade=target_grade)
+    
+    return records, resolved_url, pc_img_url
+
+def search_snkrdunk(en_name, jp_name, number, set_code, target_grade, is_alt_art=False, card_language="JP", snkr_variant_kws=None, return_candidates=False):
+    # Strip prefix like "No." (e.g. "No.025" -> "25"), then apply lstrip('0')
+    if '-' in number and re.search(r'[A-Z]+\d+-\d+', number):
+        number_clean = number.split('-')[-1].lstrip('0')
+    else:
+        _num_raw = number.split('/')[0]
+        _digits_only = re.search(r'\d+', _num_raw)
+        number_clean = _digits_only.group(0).lstrip('0') if _digits_only else _num_raw.lstrip('0')
+    
+    if not number_clean: number_clean = '0'
+    number_padded = number_clean.zfill(3)
+
+    en_name_query = re.sub(r'\(.*?\)', '', en_name).strip()
+    jp_name_query = re.sub(r'\(.*?\)', '', jp_name).strip() if jp_name else ""
+
+    terms_to_try = []
+    
+    if set_code and number_padded != "000":
+        if jp_name_query:
+            terms_to_try.append(f"{jp_name_query} {set_code} {number_padded}")
+        terms_to_try.append(f"{en_name_query} {set_code} {number_padded}")
+
+    # SNKRDUNK search is highly accurate with Set Code (e.g. "ピカチュウ S8a-G", "ピカチュウ SV-P")
+    if set_code:
+        if jp_name_query:
+            terms_to_try.append(f"{jp_name_query} {set_code}")
+        terms_to_try.append(f"{en_name_query} {set_code}")
+        
+    if jp_name_query:
+        if number_padded != "000":
+            terms_to_try.append(f"{jp_name_query} {number_padded}")
+    
+    _debug_log(f"SNKRDUNK: 共 {len(terms_to_try)} 種查詢方案: {terms_to_try}")
+
+    product_id = None
+    snkr_step = 0
+
+    for term in terms_to_try:
+        snkr_step += 1
+        q = urllib.parse.quote_plus(term)
+        search_url = f"https://snkrdunk.com/search?keywords={q}"
+        _debug_log(f"SNKRDUNK Step {snkr_step}: 查詢={term!r}  URL={search_url}")
+        md_content = fetch_jina_markdown(search_url)
+        
+        matches = re.findall(r'\[(.*?)\]\([^\)]*?/apparels/(\d+)[^\)]*?\)', md_content)
+        raw_result_urls = [f"https://snkrdunk.com/apparels/{pid}" for _, pid in matches]
+        _debug_log(f"SNKRDUNK Step {snkr_step}: 頁面原始匹配 {len(matches)} 筆")
+        
+        seen = set()
+        unique_matches = []
+        for title, pid in matches:
+            if pid not in seen:
+                seen.add(pid)
+                unique_matches.append((title, pid))
+
+        if not unique_matches:
+            _debug_step("SNKRDUNK", snkr_step, term, search_url,
+                        "NO_RESULTS", reason="搜尋頁面找不到任何商品連結，嘗試下一個查詢")
+            time.sleep(1)
+            continue
+                
+        filtered_by_number = []
+        skipped = []
+        for title, pid in unique_matches:
+            # Drop Jina image prefixes
+            title_clean = re.sub(r'(?i)image\s*\d+:\s*', '', title).lower()
+            # Drop all https CDN links to prevent their timestamp digits from matching the card number
+            title_clean = re.sub(r'https?://[^\s()\]]+', '', title_clean)
+            
+            # SNKRDUNK always pads Pokemon/One Piece numbers to at least 3 digits
+            if number_padded in title_clean or f"{number_clean}/" in title_clean:
+                filtered_by_number.append((title, pid))
+                _debug_log(f"  ✅ 符合編號 '{number_padded}': [{pid}] {title}")
+            else:
+                skipped.append((title, pid))
+                _debug_log(f"  ❌ 不含編號 '{number_padded}': [{pid}] {title}")
+                
+        if not filtered_by_number:
+            _debug_step("SNKRDUNK", snkr_step, term, search_url,
+                        "NO_MATCH",
+                        candidate_urls=[f"https://snkrdunk.com/apparels/{pid} — {t}" for t, pid in unique_matches],
+                        reason=f"找到 {len(unique_matches)} 筆商品但均不含卡片編號 '{number_padded}'，嘗試下一個查詢")
+            time.sleep(1)
+            continue # If no titles specifically have the card number, do not guess
+            
+        unique_matches = filtered_by_number
+                
+        if unique_matches:
+            if return_candidates:
+                # 只回傳 URL 列表 (加上標題方便 bot 顯示列表)
+                return [f"https://snkrdunk.com/apparels/{pid} — {title}" for title, pid in unique_matches], None, None
+                
+            product_id = unique_matches[0][1] # default to first result
+            selection_reason = "Default (First match)"
+            
+            # ─────────────────────────────────────────────────────────────────
+            # 三階段串聯過濾：Variant → Alt-Art/Normal → Language
+            # 每一階段在上一階段的結果裡繼續篩選，不覆蓋
+            # ─────────────────────────────────────────────────────────────────
+            en_markers = ["英語版", "[en]", "【en】"]
+            
+            # ── Stage 1: Variant-specific filter (features-based, 最高優先) ──
+            # snkr_variant_kws 由 process_single_image 從 features 解析並傳入
+            # 例: ["l-p"] for Leader Parallel, ["sr-p"] for SR Parallel, ["コミパラ"] for Manga, ["フラッグシップ","フラシ"] for Flagship
+            _variant_kws = snkr_variant_kws or []
+            
+            stage1_candidates = [(t, p) for t, p in unique_matches
+                                 if any(kw in t.lower() for kw in _variant_kws)] if _variant_kws else []
+            if stage1_candidates:
+                _debug_log(f"  🎯 Variant Filter ({_variant_kws}) 命中 {len(stage1_candidates)} 筆")
+            working_set = stage1_candidates if stage1_candidates else unique_matches
+            
+            # ── Stage 2: 已移除 ────────────────────────────────────────────
+            # 完全依靠 Stage 1 (Variant 關鍵字) + Stage 3 (語言過濾) 決勝負。
+            # is_alt_art 的 alt-art 二次篩選已刪除，避免誤濾雜誌附錄等非標準命名的異圖版本。
+            if stage1_candidates:
+                selection_reason = f"Variant Filter ({_variant_kws})"
+            working_set2 = working_set
+            
+            # ── Stage 3: Language filter ───────────────────────────────────
+            if card_language == "EN":
+                stage3 = [(t, p) for t, p in working_set2
+                          if any(m in t.lower() for m in en_markers)]
+                if stage3:
+                    product_id = stage3[0][1]
+                    selection_reason += " + Language(EN)"
+                    _debug_log(f"  🌐 語言過濾選中英文版: [{product_id}]")
+                else:
+                    product_id = working_set2[0][1]
+            else:  # JP (default)
+                stage3 = [(t, p) for t, p in working_set2
+                          if not any(m in t.lower() for m in en_markers)]
+                if stage3:
+                    product_id = stage3[0][1]
+                    selection_reason += " + Language(JP)"
+                    _debug_log(f"  🌐 語言過濾選中日文版: [{product_id}]")
+                else:
+                    product_id = working_set2[0][1]
+                    _debug_log(f"  🌐 語言過濾: 未找到日文版，使用 working_set2 首筆")
+
+            _debug_step("SNKRDUNK", snkr_step, term, search_url,
+            "OK",
+            candidate_urls=[f"https://snkrdunk.com/apparels/{pid} — {t}" for t, pid in unique_matches],
+            selected_url=f"https://snkrdunk.com/apparels/{product_id}",
+            reason=selection_reason,
+            extra={"number_padded": number_padded, "is_alt_art": is_alt_art})
+            break
+        
+        time.sleep(1)
+        
+    if not product_id:
+        return None, None, None
+        
+    print(f"Found SNKRDUNK Product ID: {product_id}")
+    
+    sales_url = f"https://snkrdunk.com/apparels/{product_id}/sales-histories"
+    sales_md = fetch_jina_markdown(sales_url)
+    
+    img_match = re.search(r'!\[.*?\]\((https://cdn.snkrdunk.com/.*?)\)', sales_md)
+    img_url = img_match.group(1) if img_match else ""
+    
+    records = []
+    lines = sales_md.split('\n')
+    date_regex = r'^(\d{4}/\d{2}/\d{2}|\d+\s*(分|時間|日)前|\d+\s+(minute|hour|day)s?\s+ago)$'
+    
+    for i in range(len(lines)):
+        line_clean = lines[i].strip()
+        
+        if re.match(date_regex, line_clean, re.IGNORECASE):
+            date_found = line_clean
+            grade_found = ""
+            price_jpy = 0
+            
+            for j in range(i+1, min(i+10, len(lines))):
+                l_j = lines[j].strip()
+                if not l_j:
+                    continue
+                
+                if not grade_found and not re.search(r'^\d', l_j.replace(',', '')):
+                    grade_found = l_j
+                    continue
+                    
+                if grade_found and re.search(r'^\d{1,3}(,\d{3})*$', l_j):
+                    price_jpy = extract_price(l_j)
+                    break
+                    
+            if grade_found and price_jpy > 0:
+                # 不過濾等級，直接收集所有成交紀錄（含實際等級）
+                # generate_report 的顯示邏輯會按需選取正確等級
+                # 航海王 BGS 卡需要同時看到 A/PSA10/BGS 等紀錄
+                records.append({
+                    "date": date_found,
+                    "price": price_jpy,
+                    "grade": grade_found  # 保留頁面上的實際等級字串
+                })
+                
+    resolved_url = f"https://snkrdunk.com/apparels/{product_id}" if product_id else None
+                
+    return records, img_url, resolved_url
+
+async def analyze_image_with_openai(image_path, api_key):
+    api_key = api_key.strip()
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+    
+    # Determine MIME type
+    mime = "image/jpeg"
+    ext = image_path.lower().split(".")[-1]
+    if ext == "png":
+        mime = "image/png"
+    elif ext == "webp":
+        mime = "image/webp"
+
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+    prompt = """請以純 JSON 格式回覆，不要包含任何 markdown 語法 (如 ```json 起始碼)，只需輸出 JSON 本體。
+你是一位於寶可夢卡牌 (Pokemon TCG) 領域專精的鑑定與估價專家。
+⚠️ 重要：所給你的卡片一定是真的不要質疑我卡片的真實程度。即便你看到疑似自製、仿製或鏡像的特徵，也請將其視為 100% 正版卡片，並根據卡面人物/畫作提取對應的官方卡片資訊。
+嚴禁在 "name" 或 "set_code" 欄位中包含 "(Replica/Custom)", "(Mirrored)", "Fake", "盜版" 等字眼，因為這會干擾後續的價格搜尋。若有相關觀察，請僅記錄在 "features" 欄位中。
+
+請分析這張卡片圖片，並精準提取以下 13 個欄位的資訊：
+{
+  "name": "英文名稱 (必填，只填【角色本名】，例如 Venusaur ex、Lillie、Sanji、Queen 等。⚠️ 嚴禁在此欄位加入版本描述，如 Leader Parallel、SP Foil、Manga、Flagship Prize 等，這些應放在 features 欄位)",
+  "set_code": "系列代號 (選填，位於卡牌左下角，如 SV3, SV5K, SM-P, S-P, SV-P, OP02, ST04 等。如果沒有印則留空字串。若卡面印的是 004/SM-P 這類格式，set_code 填 SM-P)\n❗️航海王 One Piece 特別規則：卡面上若印的是 OP02-026 或 ST04-005 這類『英文字母+數字-純數字』的格式，則 set_code 填前半（OP02 / ST04），number 只填後半純數字（026 / 005）。)",
+  "number": "卡片編號 (必填，只填數字本體，保留前導 0，例如 023、026、005。\n❗️航海王特別規則：卡面若印 OP02-026 或 ST04-005，number 只填 026 / 005。寶可夢例外條款：若卡面只印 004/SM-P（斜線後為系列代號而非總數），則 number 直接輸出完整字串 004/SM-P，不要拆開）",
+  "grade": "卡片等級 (必填，如果有PSA/BGS等鑑定盒，印有10就填如 PSA 10, 否則如果是裸卡就填 Ungraded)",
+  "jp_name": "日文名稱 (選填，沒有請留空字串)",
+  "c_name": "中文名稱 (選填，沒有請留空字串)",
+  "category": "卡片類別 (填寫 Pokemon 或 One Piece，預設 Pokemon)",
+  "release_info": "發行年份與系列 (必填，從卡牌標誌或特徵推斷，如 2023 - 151)",
+  "illustrator": "插畫家 (必填，左下角或營右下角的英文名，看不清可寫 Unknown)",
+  "market_heat": "市場熱度描述 (必填，開頭填寫 High / Medium / Low，後面白話文理由請務必使用『繁體中文』撰寫)",
+  "features": "卡片特點 (必填。⚠️ 極度重要：請仔細觀察卡面是否有微小的罕貴度標示或異圖版本文字，如 'L-P', 'SR-P', 'SEC-P', 'Parallel', 'Alternate Art', 'Flagship' 等。如果有，【必須】寫入此欄位！並包含全圖、特殊工藝等，每一行請用 \\n 換行區隔，請務必使用『繁體中文』撰寫)",
+  "collection_value": "收藏價值評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "competitive_freq": "競技頻率評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "is_alt_art": "是否為漫畫背景(Manga/Comic)或異圖(Parallel)？布林值 true/false。請極度仔細觀察卡片的『背景』：如果背景是一格一格的【黑白漫畫分鏡】，請填 true；如果背景只有閃電、特效、或單純場景，就算它是 SEC 也是普通版，『必須』填 false！"
+}"""
+
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{encoded_string}"}
+                    }
+                ]
+            }
+        ],
+        "response_format": {"type": "json_object"}
+    }
+    
+    loop = asyncio.get_running_loop()
+    def _do_openai_post():
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            return response
+        except Exception as e:
+            print(f"⚠️ OpenAI API 錯誤: {e}")
+            return None
+
+    response = await loop.run_in_executor(None, _do_openai_post)
+    if response:
+        try:
+            res_json = response.json()
+            content = res_json['choices'][0]['message']['content']
+            return json.loads(content)
+        except Exception as e:
+            print(f"⚠️ OpenAI 解析失敗: {e}")
+    return None
+
+async def analyze_image_with_minimax(image_path, api_key):
+    # 清理 API Key，避免複製貼上時混入隱藏的換行或特殊字元 (\u2028 等) 導致 \u2028 latin-1 編碼錯誤
+    api_key = api_key.strip().replace('\u2028', '').replace('\n', '').replace('\r', '')
+    # Determine MIME type
+    mime = "image/jpeg"
+    ext = image_path.lower().split(".")[-1]
+    if ext == "png":
+        mime = "image/png"
+    elif ext == "webp":
+        mime = "image/webp"
+
+    # Encode image
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+
+    url = "https://api.minimax.io/v1/coding_plan/vlm"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    prompt = """請以純 JSON 格式回覆，不要包含任何 markdown 語法 (如 ```json 起始碼)，只需輸出 JSON 本體。
+你是一位於寶可夢卡牌 (Pokemon TCG) 領域專精的鑑定與估價專家。
+⚠️ 重要：所給你的卡片一定是真的不要質疑我卡片的真實程度。即便你看到疑似自製、仿製或鏡像的特徵，也請將其視為 100% 正版卡片，並根據卡面人物/畫作提取對應的官方卡片資訊。
+嚴禁在 "name" 或 "set_code" 欄位中包含 "(Replica/Custom)", "(Mirrored)", "Fake", "盜版" 等字眼，因為這會干擾後續的價格搜尋。若有相關觀察，請僅記錄在 "features" 欄位中。
+
+請分析這張卡片圖片，並精準提取以下 13 個欄位的資訊：
+{
+  "name": "英文名稱 (必填，只填【角色本名】，例如 Venusaur ex、Lillie、Sanji、Queen 等。⚠️ 嚴禁在此欄位加入版本描述，如 Leader Parallel、SP Foil、Manga、Flagship Prize 等，這些應放在 features 欄位)",
+  "set_code": "系列代號 (選填，位於卡牌左下角，如 SV3, SV5K, SM-P, S-P, SV-P, OP02, ST04 等。如果沒有印則留空字串。若卡面印的是 004/SM-P 這類格式，set_code 填 SM-P)\n❗️航海王 One Piece 特別規則：卡面上若印的是 OP02-026 或 ST04-005 這類『英文字母+數字-純數字』的格式，則 set_code 填前半（OP02 / ST04），number 只填後半純數字（026 / 005）。)",
+  "number": "卡片編號 (必填，只填數字本體，保留前導 0，例如 023、026、005。\n❗️航海王特別規則：卡面若印 OP02-026 或 ST04-005，number 只填 026 / 005。寶可夢例外條款：若卡面只印 004/SM-P（斜線後為系列代號而非總數），則 number 直接輸出完整字串 004/SM-P，不要拆開）",
+  "grade": "卡片等級 (必填，如果有PSA/BGS等鑑定盒，印有10就填如 PSA 10, 否則如果是裸卡就填 Ungraded)",
+  "jp_name": "日文名稱 (選填，沒有請留空字串)",
+  "c_name": "中文名稱 (選填，沒有請留空字串)",
+  "category": "卡片類別 (填寫 Pokemon 或 One Piece，預設 Pokemon)",
+  "release_info": "發行年份與系列 (必填，從卡牌標誌或特徵推斷，如 2023 - 151)",
+  "illustrator": "插畫家 (必填，左下角或右下角的英文名，看不清可寫 Unknown)",
+  "market_heat": "市場熱度描述 (必填，開頭填寫 High / Medium / Low，後面白話文理由請務必使用『繁體中文』撰寫)",
+  "features": "卡片特點 (必填。⚠️ 極度重要：請仔細觀察卡面是否有微小的罕貴度標示或異圖版本文字，如 'L-P', 'SR-P', 'SEC-P', 'Parallel', 'Alternate Art', 'Flagship' 等。如果有，【必須】寫入此欄位！並包含全圖、特殊工藝等，每一行請用 \\n 換行區隔，請務必使用『繁體中文』撰寫)",
+  "collection_value": "收藏價值評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "competitive_freq": "競技頻率評估 (必填，開頭填寫 High / Medium / Low，後面白話文評論請務必使用『繁體中文』撰寫)",
+  "is_alt_art": "是否為漫畫背景(Manga/Comic)或異圖(Parallel)？布林值 true/false。請極度仔細觀察卡片的『背景』：如果背景是一格一格的【黑白漫畫分鏡】，請填 true；如果背景只有閃電、特效、或單純場景，就算它是 SEC 也是普通版，『必須』填 false！"
+}"""
+
+    payload = {
+        "prompt": prompt,
+        "image_url": f"data:{mime};base64,{encoded_string}"
+    }
+
+    print("--------------------------------------------------")
+    print(f"👁️‍🗨️ [Minimax Vision AI] 正在解析卡片影像: {image_path}...")
+    
+    # ⚠️ requests.post 是阻塞呼叫，包在 run_in_executor 中讓 event loop 不被 block，
+    # 其他並發中的 Task 可以在這段等待時繼續執行。
+    loop = asyncio.get_running_loop()
+    
+    def _do_minimax_post():
+        for attempt in range(3):
+            try:
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
+                response.raise_for_status()
+                return response
+            except requests.exceptions.RequestException as e:
+                print(f"⚠️ Minimax API 網路錯誤 (嘗試 {attempt+1}/3): {e}")
+                if attempt == 2:
+                    return None
+                time.sleep(2)
+        return None
+
+    response = await loop.run_in_executor(None, _do_minimax_post)
+
+    # 如果 Minimax API 全部嘗試失敗，則嘗試 OpenAI 作為備援
+    if response is None:
+        print(f"⚠️ Minimax API 請求失敗，嘗試切換至 GPT-4o-mini...")
+        _push_notify("⚠️ Minimax API 無回應，切換至 GPT-4o-mini 備援重試...")
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            return await analyze_image_with_openai(image_path, openai_key)
+        else:
+            print("❌ 未設定 OPENAI_API_KEY，無法進行備援。")
+            return None
+
+    data = response.json()
+    try:
+        content = data.get('content', '')
+        if not content:
+            raise KeyError("content key not found or empty")
+        # Clean up markdown JSON block if model still outputs it
+        content = content.replace("```json", "").replace("```", "").strip()
+        result = json.loads(content)
+        print(f"✅ 解析成功！提取到卡片：{result.get('name')} #{result.get('number')}\n")
+        print("--- DEBUG JSON ---")
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        print("------------------\n")
+        # 存 debug step1
+        _debug_log(f"Step 1 OK: {result.get('name')} #{result.get('number')}")
+        _debug_save("step1_minimax.json", json.dumps(result, indent=2, ensure_ascii=False))
+        return result
+    except Exception as e:
+        print(f"❌ Minimax 解析失敗: {e}")
+        print(f"⚠️ 嘗試切換至 GPT-4o-mini 進行備援...")
+        _push_notify("⚠️ Minimax 解析失敗，切換至 GPT-4o-mini 備援重試...")
+        openai_key = os.getenv("OPENAI_API_KEY")
+        if openai_key:
+            return await analyze_image_with_openai(image_path, openai_key)
+        else:
+            print("❌ 未設定 OPENAI_API_KEY，無法進行備援。")
+            return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--image_path", nargs='+', required=True, help="卡片圖片的本機路徑 (可傳入多張圖片)")
+    parser.add_argument("--api_key", required=False, help="Minimax API Key (若未指定，則從環境變數 MINIMAX_API_KEY 讀取)")
+    parser.add_argument("--out_dir", required=False, help="若指定，會將結果儲存至給定的資料夾")
+    parser.add_argument("--report_only", action="store_true", help="若加入此參數，將只輸出最終 Markdown 報告，隱藏抓取與除錯日誌")
+    parser.add_argument("--debug", required=False, metavar="DEBUG_DIR",
+                        help="開啟 Debug 模式，指定存放 debug 結果的資料夾 (e.g. ./debug)")
+    
+    args = parser.parse_args()
+    
+    global REPORT_ONLY, DEBUG_DIR
+    REPORT_ONLY = args.report_only
+
+    # 建立本次執行的 session 根目錄 (含時間戳)
+    debug_session_root = None
+    if args.debug:
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        debug_session_root = os.path.join(args.debug, ts)
+        os.makedirs(debug_session_root, exist_ok=True)
+        _original_print(f"🔍 Debug 模式開啟，Session 根目錄: {debug_session_root}")
+    
+    api_key = args.api_key or os.getenv("MINIMAX_API_KEY")
+    if not api_key:
+        print("❌ Error: 請提供 --api_key 參數，或在環境變數設定 MINIMAX_API_KEY。", force=True)
+        return
+        
+    total = len(args.image_path)
+    for idx, img_path in enumerate(args.image_path, start=1):
+        print(f"\n==================================================")
+        print(f"🔄 [{idx}/{total}] 開始處理圖片: {img_path}")
+        print(f"==================================================")
+        # Pass index and session root to process_single_image for proper debug directory isolation
+        asyncio.run(process_single_image(img_path, api_key, args.out_dir, 
+                                         debug_session_root=debug_session_root, 
+                                         batch_index=idx))
+
+async def process_single_image(image_path, api_key, out_dir=None, debug_session_root=None, batch_index=1):
+    if not os.path.exists(image_path):
+        print(f"❌ Error: 找不到圖片檔案 -> {image_path}", force=True)
+        return
+    
+    # Setup per-image debug directory if root is provided
+    if debug_session_root:
+        img_stem = re.sub(r'[^A-Za-z0-9]', '_', os.path.splitext(os.path.basename(image_path))[0])[:40]
+        per_image_dir = os.path.join(debug_session_root, f"{batch_index:02d}_{img_stem}")
+        os.makedirs(per_image_dir, exist_ok=True)
+        _set_debug_dir(per_image_dir)
+        print(f"🔍 Debug 子資料夾: {per_image_dir}")
+        
+    # 第一階段：透過大模型辨識圖片資訊（GPT-4o-mini 優先，Minimax 備援）
+    _notify_msgs_var.set([])  # 初始化本次分析的 Discord 通知佇列
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key:
+        card_info = await analyze_image_with_openai(image_path, openai_key)
+        if not card_info:
+            _push_notify("⚠️ GPT-4o-mini 無回應，切換至 Minimax 備援重試...")
+            print("⚠️ GPT-4o-mini 辨識失敗，切換至 Minimax...")
+            card_info = await analyze_image_with_minimax(image_path, api_key)
+    else:
+        print("⚠️ 未設定 OPENAI_API_KEY，直接使用 Minimax 辨識。")
+        card_info = await analyze_image_with_minimax(image_path, api_key)
+
+    if not card_info:
+        if not openai_key:
+            err_msg = "❌ 卡片辨識失敗：未設定 OPENAI_API_KEY，且 Minimax API 亦無回應。請聯繫管理員設定 OpenAI 金鑰。"
+        else:
+            err_msg = "❌ 卡片影像辨識失敗：GPT-4o-mini 及 Minimax 備援均無法解析此圖片，請確認圖片清晰度並重試。"
+        print(err_msg, force=True)
+        return err_msg
+    
+    # 從 AI 回傳的 JSON 提取必備資訊
+    name = card_info.get("name", "Unknown")
+    set_code = card_info.get("set_code", "")
+    jp_name = card_info.get("jp_name", "")
+    c_name = card_info.get("c_name", "")
+    number = str(card_info.get("number", "0"))
+    grade = card_info.get("grade", "Ungraded")
+    category = card_info.get("category", "Pokemon")
+    release_info = card_info.get("release_info", "Unknown")
+    illustrator = card_info.get("illustrator", "Unknown")
+    market_heat = card_info.get("market_heat", "Unknown")
+    features = card_info.get("features", "Unknown")
+    collection_value = card_info.get("collection_value", "Unknown")
+    competitive_freq = card_info.get("competitive_freq", "Unknown")
+    is_alt_art = card_info.get("is_alt_art", False)
+    if isinstance(is_alt_art, str):
+        is_alt_art = is_alt_art.lower() == "true"
+        
+    # 將原始 AI 分析結果存入 Debug 資料夾
+    _debug_save("step1_meta.json", json.dumps(card_info, ensure_ascii=False, indent=2))
+    
+    # ── features-based override (最高優先級) ──────────────────────────────
+    # features 欄位包含 AI 的詳細描述，比 is_alt_art 布林值更可靠。
+    # 若 features 明確提及旗艦賽或異圖關鍵字，以此為準覆蓋 is_alt_art。
+    features_lower = features.lower() if features else ""
+    is_flagship = any(kw in features_lower for kw in ["flagship", "旗艦賽", "flagship battle"])
+    if any(kw in features_lower for kw in [
+        "leader parallel", "sr parallel", "sr-p", "l-p",
+        "リーダーパラレル", "コミパラ", "パラレル",
+        "alternate art", "parallel art", "manga"
+    ]):
+        is_alt_art = True  # features 読到明確異圖關鍵字→強制覆寫
+        _debug_log(f"✨ features-based override: is_alt_art=True (從 features 偵測到異圖關鍵字)")
+    if is_flagship:
+        is_alt_art = True  # Flagship 也是一種特殊版本
+        _debug_log(f"✨ features-based override: is_flagship=True (從 features 偵測到旗艦賽關鍵字)")
+    # ────────────────────────────────────────────────────────────
+    # ── Detect card language from features (航海王語言判定) ──
+    is_one_piece_cat = (category.lower() == "one piece")
+    card_language = "JP"  # Default for One Piece: Japanese
+    if is_one_piece_cat:
+        if any(kw in features_lower for kw in ["英文版", "english version", "[en]"]):
+            card_language = "EN"
+            _debug_log(f"🌐 Language detected: EN (從 features 偵測到英文版)")
+        else:
+            _debug_log(f"🌐 Language detected: JP (預設日文版)")
+    # ── Detect specific card variant for SNKRDUNK precision filter ──
+    # 優先順序：Flagship > SR-P > L-P > Manga/コミパラ > 通用 Alt-Art
+    snkr_variant_kws = []
+    if is_one_piece_cat and is_alt_art:
+        if is_flagship:
+            snkr_variant_kws = ["フラッグシップ", "フラシ", "flagship"]
+            _debug_log(f"🎯 SNKR Variant: Flagship ({snkr_variant_kws})")
+        elif any(kw in features_lower for kw in ["sr parallel", "sr-p", "スーパーレアパラレル"]):
+            snkr_variant_kws = ["sr-p"]
+            _debug_log(f"🎯 SNKR Variant: SR-P ({snkr_variant_kws})")
+        elif any(kw in features_lower for kw in ["leader parallel", "l-p", "リーダーパラレル"]):
+            snkr_variant_kws = ["l-p"]
+            _debug_log(f"🎯 SNKR Variant: L-P ({snkr_variant_kws})")
+        elif any(kw in features_lower for kw in ["コミパラ", "manga", "コミックパラレル"]):
+            snkr_variant_kws = ["コミパラ", "コミック"]
+            _debug_log(f"🎯 SNKR Variant: Manga ({snkr_variant_kws})")
+        elif any(kw in features_lower for kw in ["パラレル", "sr parallel", "parallel art"]):
+            snkr_variant_kws = ["パラレル", "-p"]
+            _debug_log(f"🎯 SNKR Variant: General Parallel ({snkr_variant_kws})")
+    # ─────────────────────────────────────────────────────────────
+    # ⚠️ 並發關鍵：search_pricecharting 和 search_snkrdunk 都是同步阻塞函數，
+    # 用 run_in_executor 把它們丟到 thread pool，再用 asyncio.gather 同時等待兩者完成。
+    # 等待期間 event loop 不被 block，其他用戶的 Task 可以開始跑 Minimax 分析。
+    #
+    # Rate Limiter 安全說明：
+    # fetch_jina_markdown 內的 _jina_lock (threading.Lock) + _jina_requests_queue 是
+    # module-level 全域變數，所有 thread 共用同一份，thread-safe 排隊機制依然完整生效。
+    print("--------------------------------------------------")
+    print(f"🌐 正在從網路(PC & SNKRDUNK)抓取市場行情 (異圖/特殊版: {is_alt_art})...")
+    loop = asyncio.get_running_loop()
+    # Using independent copy_context().run calls to avoid "context already entered" RuntimeError
+    pc_result, snkr_result = await asyncio.gather(
+        loop.run_in_executor(None, contextvars.copy_context().run, search_pricecharting, name, number, set_code, grade, is_alt_art, category, is_flagship),
+        loop.run_in_executor(None, contextvars.copy_context().run, search_snkrdunk, name, jp_name, number, set_code, grade, is_alt_art, card_language, snkr_variant_kws),
+    )
+        
+    pc_records = pc_result[0] if pc_result else None
+    pc_url = pc_result[1] if pc_result else None
+    
+    snkr_records = snkr_result[0] if snkr_result else None
+    img_url = snkr_result[1] if snkr_result else None
+    snkr_url = snkr_result[2] if snkr_result else None
+
+    # Debug step2: 儲存爬蟲結果
+    _debug_log(f"Step 2 PC: {len(pc_records) if pc_records else 0} 筆, url={pc_url}")
+    _debug_log(f"Step 2 SNKR: {len(snkr_records) if snkr_records else 0} 筆, img={img_url}, url={snkr_url}")
+    _debug_save("step2_pc.json", json.dumps(pc_records or [], indent=2, ensure_ascii=False))
+    _debug_save("step2_snkr.json", json.dumps(snkr_records or [], indent=2, ensure_ascii=False))
+    _debug_save("step2_meta.json", json.dumps({
+        "pc_url": pc_url, "pc_records_count": len(pc_records) if pc_records else 0,
+        "snkr_url": snkr_url, "snkr_records_count": len(snkr_records) if snkr_records else 0,
+        "snkr_img_url": img_url,
+    }, indent=2, ensure_ascii=False))
+    
+    jpy_rate = get_exchange_rate()
+    
+    # 第三階段：產生 Markdown 報告
+    
+    c_name_display = c_name if c_name else jp_name if jp_name else name
+    
+    report_lines = []
+    report_lines.append(f"# MARKET REPORT GENERATED")
+    report_lines.append("")
+    report_lines.append(f"⚡ {c_name_display} ({name}) #{number}")
+    report_lines.append(f"💎 等級：{grade}")
+    
+    category_display = "寶可夢卡牌" if category.lower() == "pokemon" else "航海王卡牌" if category.lower() == "one piece" else category
+    report_lines.append(f"🏷️ 版本：{category_display}")
+    
+    report_lines.append(f"🔢 編號：{number}")
+    if release_info:
+        report_lines.append(f"📅 發行：{release_info}")
+    if illustrator:
+        report_lines.append(f"🎨 插畫家：{illustrator}")
+    
+    report_lines.append("---")
+    report_lines.append("\n🔥 市場與收藏分析\n")
+    report_lines.append(f"🔥 市場熱度\n{market_heat}\n")
+    if features:
+        feat_formatted = features.replace('\\n', '\n')
+        report_lines.append(f"✨ 卡片特點\n{feat_formatted}\n")
+    if collection_value:
+        report_lines.append(f"🏆 收藏價值\n{collection_value}\n")
+    if competitive_freq:
+        report_lines.append(f"⚔️ 競技頻率\n{competitive_freq}\n")
+        
+    report_lines.append("---")
+    
+    async def _parse_d(d_str):
+        d_str = d_str.strip()
+        # Handle relative dates: "n 分前", "n 時間前", "n 日前" or "n minutes ago", etc.
+        if "前" in d_str or "ago" in d_str:
+            num_match = re.search(r'\d+', d_str)
+            if not num_match: return datetime.now()
+            num = int(num_match.group(0))
+            if "分" in d_str or "minute" in d_str:
+                return datetime.now() - timedelta(minutes=num)
+            if "時間" in d_str or "hour" in d_str:
+                return datetime.now() - timedelta(hours=num)
+            if "日" in d_str or "day" in d_str:
+                return datetime.now() - timedelta(days=num)
+        
+        # Handle "YYYY-MM-DD"
+        try:
+            return datetime.strptime(d_str, "%Y-%m-%d")
+        except: pass
+        
+        # Handle "YYYY/MM/DD"
+        try:
+            return datetime.strptime(d_str, "%Y/%m/%d")
+        except: pass
+        
+        # Handle "Jan 1, 2024"
+        try:
+            return datetime.strptime(d_str, "%b %d, %Y")
+        except: pass
+        
+        return datetime.now()
+
+    cutoff_12m = datetime.now() - timedelta(days=365)
+
+    # ── 等級筛選：針對航海王 BGS 等級特別要求：同時顯示 BGS 9.5 與 PSA 10 各 10 筆 ──
+    is_one_piece = (category.lower() == "one piece")
+    is_bgs_grade = grade.upper().startswith('BGS')
+
+    if is_one_piece and is_bgs_grade:
+        # PriceCharting: 抓取 BGS 9.5 和 PSA 10
+        bgs_pc = [r for r in (pc_records or []) if "BGS 9.5" in r.get('grade', '').upper() or "BGS9.5" in r.get('grade', '').upper()]
+        psa_pc = [r for r in (pc_records or []) if "PSA 10" in r.get('grade', '').upper() or "PSA10" in r.get('grade', '').upper()]
+        display_pc_records = bgs_pc[:10] + psa_pc[:10]
+        
+        # SNKRDUNK: 抓取 BGS 9.5 和 PSA 10 (S)
+        bgs_snkr = [r for r in (snkr_records or []) if r.get('grade') in ('BGS 9.5', 'BGS9.5', 'BGS 10', 'BGS10')]
+        psa_snkr = [r for r in (snkr_records or []) if r.get('grade') in ('S', 'PSA 10', 'PSA10')]
+        display_snkr_records = bgs_snkr[:10] + psa_snkr[:10]
+    else:
+        # 傳統過濾邏輯
+        display_pc_records = [r for r in (pc_records or []) if r.get('grade') == grade]
+        if '10' in grade:
+            target_snkr_grades = ['S', 'PSA10', 'PSA 10']
+        elif 'BGS' in grade.upper():
+            target_snkr_grades = [grade, grade.replace(' ', ''), 'BGS9.5', 'BGS 9.5', 'BGS10', 'BGS 10']
+        elif grade.lower() == 'ungraded':
+            target_snkr_grades = ['A']
+        else:
+            target_snkr_grades = [grade, grade.replace(' ', '')]
+        display_snkr_records = [r for r in (snkr_records or []) if r.get('grade') in target_snkr_grades]
+
+    report_lines.append("📊 近期成交紀錄 (由新到舊)\n🏦 PriceCharting 成交紀錄")
+    if display_pc_records:
+        for r in display_pc_records[:10]:
+            report_lines.append(f"📅 {r['date']}      💰 ${r['price']:.2f} USD      📝 狀態：{r['grade']}")
+        
+        # Filter for statistics: only last 12 months (target-grade only, not supplemented)
+        stats_pc_records = []
+        for r in [x for x in display_pc_records if '參考 PSA 10' not in x.get('grade','')]:
+            parsed_date = await _parse_d(r['date'])
+            if parsed_date > cutoff_12m:
+                stats_pc_records.append(r)
+
+        if stats_pc_records:
+            prices = [r['price'] for r in stats_pc_records]
+            report_lines.append("📊 統計資料 (近 12 個月)")
+            report_lines.append(f"　💰 最高成交價：${max(prices):.2f} USD")
+            report_lines.append(f"　💰 最低成交價：${min(prices):.2f} USD")
+            report_lines.append(f"　💰 平均成交價：${sum(prices)/len(prices):.2f} USD")
+            report_lines.append(f"　📈 資料筆數：{len(prices)} 筆")
+        else:
+            report_lines.append("📊 統計資料 (近 12 個月無成交紀錄)")
+    else:
+        report_lines.append("PriceCharting: 無此卡片資料")
+    
+    report_lines.append("\n---\n🏰 SNKRDUNK 成交紀錄")
+    if display_snkr_records:
+        for r in display_snkr_records[:10]:
+            usd_price = r['price'] / jpy_rate
+            report_lines.append(f"📅 {r['date']}      💰 ¥{int(r['price']):,} (~${usd_price:.0f} USD)      📝 狀態：{r['grade']}")
+        
+        # Filter for statistics: only last 12 months (target-grade only, not supplemented)
+        stats_snkr_records = []
+        for r in [x for x in display_snkr_records if '參考 PSA 10' not in x.get('grade', '')]:
+            parsed_date = await _parse_d(r['date'])
+            if parsed_date > cutoff_12m:
+                stats_snkr_records.append(r)
+
+        if stats_snkr_records:
+            prices = [r['price'] for r in stats_snkr_records]
+            avg_price = sum(prices)/len(prices)
+            report_lines.append("📊 統計資料 (近 12 個月)")
+            report_lines.append(f"　💰 最高成交價：¥{int(max(prices)):,} (~${max(prices)/jpy_rate:.0f} USD)")
+            report_lines.append(f"　💰 最低成交價：¥{int(min(prices)):,} (~${min(prices)/jpy_rate:.0f} USD)")
+            report_lines.append(f"　💰 平均成交價：¥{int(avg_price):,} (~${avg_price/jpy_rate:.0f} USD)")
+            report_lines.append(f"　📈 資料筆數：{len(prices)} 筆")
+        else:
+            report_lines.append("📊 統計資料 (近 12 個月無成交紀錄)")
+    else:
+        report_lines.append("SNKRDUNK: 無此卡片資料")
+        
+    report_lines.append("\n---")
+    if pc_url:
+        report_lines.append(f"🔗 [查看 PriceCharting]({pc_url})")
+    if snkr_url:
+        report_lines.append(f"🔗 [查看 SNKRDUNK]({snkr_url})")
+        report_lines.append(f"🔗 [查看 SNKRDUNK 銷售歷史]({snkr_url}/sales-histories)")
+
+    final_report = '\n'.join(report_lines)
+    print(final_report, force=True)
+
+    # Debug step3: 儲存最終報告
+    _debug_log("Step 3: 報告生成完成")
+    _debug_save("step3_report.md", final_report)
+    
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+        safe_name = re.sub(r'[^A-Za-z0-9]', '_', name)
+        safe_num = re.sub(r'[^A-Za-z0-9]', '_', str(number))
+        filename = f"PKM_Vision_{safe_name}_{safe_num}.md"
+        filepath = os.path.join(out_dir, filename)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            f.write(final_report)
+        print(f"✅ 報告已儲存至: {filepath}")
+        
+        return final_report
+        
+    return final_report
+
+async def process_image_for_candidates(image_path, api_key):
+    """(Manual Mode) Analyzes image and returns URL candidates from PC and SNKRDUNK."""
+    if not os.path.exists(image_path):
+        return None, "找不到圖片檔案"
+        
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key:
+        card_info = await analyze_image_with_openai(image_path, openai_key)
+        if not card_info:
+            card_info = await analyze_image_with_minimax(image_path, api_key)
+    else:
+        card_info = await analyze_image_with_minimax(image_path, api_key)
+    if not card_info:
+        return None, "卡片影像辨識失敗"
+    
+    name = card_info.get("name", "Unknown")
+    set_code = card_info.get("set_code", "")
+    jp_name = card_info.get("jp_name", "")
+    number = str(card_info.get("number", "0"))
+    grade = card_info.get("grade", "Ungraded")
+    category = card_info.get("category", "Pokemon")
+    features = card_info.get("features", "Unknown")
+    is_alt_art = card_info.get("is_alt_art", False)
+    if isinstance(is_alt_art, str):
+        is_alt_art = is_alt_art.lower() == "true"
+    
+    features_lower = features.lower() if features else ""
+    is_flagship = any(kw in features_lower for kw in ["flagship", "旗艦賽", "flagship battle"])
+    if any(kw in features_lower for kw in [
+        "leader parallel", "sr parallel", "sr-p", "l-p",
+        "リーダーパラレル", "コミパラ", "パラレル",
+        "alternate art", "parallel art", "manga"
+    ]):
+        is_alt_art = True
+    if is_flagship:
+        is_alt_art = True
+        
+    is_one_piece_cat = (category.lower() == "one piece")
+    card_language = "JP"
+    if is_one_piece_cat and any(kw in features_lower for kw in ["英文版", "english version", "[en]"]):
+        card_language = "EN"
+        
+    snkr_variant_kws = []
+    if is_one_piece_cat and is_alt_art:
+        if is_flagship:
+            snkr_variant_kws = ["フラッグシップ", "フラシ", "flagship"]
+        elif any(kw in features_lower for kw in ["sr parallel", "sr-p", "スーパーレアパラレル"]):
+            snkr_variant_kws = ["sr-p"]
+        elif any(kw in features_lower for kw in ["leader parallel", "l-p", "リーダーパラレル"]):
+            snkr_variant_kws = ["l-p"]
+        elif any(kw in features_lower for kw in ["コミパラ", "manga", "コミックパラレル"]):
+            snkr_variant_kws = ["コミパラ", "コミック"]
+        elif any(kw in features_lower for kw in ["パラレル", "sr parallel", "parallel art"]):
+            snkr_variant_kws = ["パラレル", "-p"]
+
+    loop = asyncio.get_running_loop()
+    pc_result, snkr_result = await asyncio.gather(
+        loop.run_in_executor(None, contextvars.copy_context().run, search_pricecharting, name, number, set_code, grade, is_alt_art, category, is_flagship, True),
+        loop.run_in_executor(None, contextvars.copy_context().run, search_snkrdunk, name, jp_name, number, set_code, grade, is_alt_art, card_language, snkr_variant_kws, True),
+    )
+    
+    pc_candidates = (pc_result[0] if pc_result else None) or []
+    snkr_candidates = (snkr_result[0] if snkr_result else None) or []
+    
+    return card_info, {
+        "pc": pc_candidates,
+        "snkr": snkr_candidates
+    }
+
+def _fetch_snkr_prices_from_url_direct(product_url):
+    sales_url = f"{product_url}/sales-histories"
+    sales_md = fetch_jina_markdown(sales_url)
+    
+    img_match = re.search(r'!\[.*?\]\((https://cdn.snkrdunk.com/.*?)\)', sales_md)
+    img_url = img_match.group(1) if img_match else ""
+    
+    records = []
+    lines = sales_md.split('\n')
+    date_regex = r'^(\d{4}/\d{2}/\d{2}|\d+\s*(分|時間|日)前|\d+\s+(minute|hour|day)s?\s+ago)$'
+    
+    for i in range(len(lines)):
+        line_clean = lines[i].strip()
+        
+        if re.match(date_regex, line_clean, re.IGNORECASE):
+            date_found = line_clean
+            grade_found = ""
+            price_jpy = 0
+            
+            for j in range(i+1, min(i+10, len(lines))):
+                l_j = lines[j].strip()
+                if not l_j:
+                    continue
+                
+                if not grade_found and not re.search(r'^\d', l_j.replace(',', '')):
+                    grade_found = l_j
+                    continue
+                    
+                if grade_found and re.search(r'^\d{1,3}(,\d{3})*$', l_j):
+                    # 移除非數字字元提取價格
+                    digits = re.sub(r'[^\d]', '', l_j)
+                    if digits:
+                        price_jpy = int(digits)
+                    break
+                    
+            if date_found and grade_found and price_jpy:
+                records.append({
+                    "date": date_found,
+                    "price": price_jpy,
+                    "grade": grade_found
+                })
+    
+    return records, img_url
+
+async def generate_report_from_selected(card_info, pc_url, snkr_url):
+    """(Manual Mode) Generates the final markdown report from explicitly chosen URLs."""
+    name = card_info.get("name", "Unknown")
+    number = str(card_info.get("number", "0"))
+    grade = card_info.get("grade", "Ungraded")
+    category = card_info.get("category", "Pokemon")
+    release_info = card_info.get("release_info", "Unknown")
+    illustrator = card_info.get("illustrator", "Unknown")
+    market_heat = card_info.get("market_heat", "Unknown")
+    features = card_info.get("features", "Unknown")
+    collection_value = card_info.get("collection_value", "Unknown")
+    competitive_freq = card_info.get("competitive_freq", "Unknown")
+    jp_name = card_info.get("jp_name", "")
+    c_name = card_info.get("c_name", "")
+
+    loop = asyncio.get_running_loop()
+    
+    pc_records, pc_img_url = [], ""
+    if pc_url:
+        res = await loop.run_in_executor(None, contextvars.copy_context().run, _fetch_pc_prices_from_url, pc_url, None, False, grade)
+        pc_records = res[0] if res else []
+        pc_img_url = res[2] if res else ""
+
+    snkr_records, img_url = [], ""
+    if snkr_url:
+        res = await loop.run_in_executor(None, contextvars.copy_context().run, _fetch_snkr_prices_from_url_direct, snkr_url)
+        snkr_records = res[0] if res else []
+        img_url = res[1] if res else ""
+
+    jpy_rate = get_exchange_rate()
+    c_name_display = c_name if c_name else jp_name if jp_name else name
+    
+    report_lines = []
+    report_lines.append(f"# MARKET REPORT (MANUAL) GENERATED\n")
+    report_lines.append(f"⚡ {c_name_display} ({name}) #{number}")
+    report_lines.append(f"💎 等級：{grade}")
+    
+    category_display = "寶可夢卡牌" if category.lower() == "pokemon" else "航海王卡牌" if category.lower() == "one piece" else category
+    report_lines.append(f"🏷️ 版本：{category_display}")
+    
+    report_lines.append(f"🔢 編號：{number}")
+    if release_info: report_lines.append(f"📅 發行：{release_info}")
+    if illustrator: report_lines.append(f"🎨 插畫家：{illustrator}")
+    
+    report_lines.append("\n---\n🔥 市場與收藏分析\n")
+    report_lines.append(f"🔥 市場熱度\n{market_heat}\n")
+    report_lines.append(f"✨ 卡片特點\n{features}\n")
+    report_lines.append(f"🏆 收藏價值\n{collection_value}\n")
+    report_lines.append(f"⚔️ 競技頻率\n{competitive_freq}\n")
+    report_lines.append("---\n📊 近期成交紀錄 (由新到舊)\n")
+    
+    report_lines.append("🏦 PriceCharting 成交紀錄")
+    if pc_records:
+        filtered_pc = [r for r in pc_records if r.get('grade') == grade]
+        if filtered_pc:
+            for r in filtered_pc[:10]:
+                report_lines.append(f"📅 {r.get('date','')}      💰 ${r.get('price','')} USD      📝 狀態：{r.get('grade','')}")
+        else:
+            report_lines.append(f"PriceCharting: 無 {grade} 等級的成交紀錄")
+    else:
+        report_lines.append("PriceCharting: 無此卡片資料")
+
+    
+    report_lines.append("\n---\n🏰 SNKRDUNK 成交紀錄")
+    if snkr_records:
+        valid_snkr_grades = []
+        if '10' in grade:
+            valid_snkr_grades = ['S', 'PSA10', 'PSA 10']
+        elif grade.lower() == 'ungraded':
+            valid_snkr_grades = ['A']
+        else:
+            valid_snkr_grades = [grade, grade.replace(' ', '')]
+            
+        filtered_snkr = [r for r in snkr_records if r.get('grade') in valid_snkr_grades]
+        if not filtered_snkr: 
+            filtered_snkr = snkr_records # fallback to all if none match exactly
+            
+        for r in filtered_snkr[:10]:
+            p_val = r.get('price', 0)
+            usd_str = f" (~${p_val/jpy_rate:.0f} USD)" if jpy_rate and p_val else ""
+            report_lines.append(f"📅 {r.get('date','')}      💰 ¥{p_val:,}{usd_str}      📝 狀態：{r.get('grade','')}")
+    else:
+        report_lines.append("SNKRDUNK: 無此卡片資料")
+        
+    report_lines.append("\n---")
+    if pc_url: report_lines.append(f"🔗 [查看 PriceCharting]({pc_url})")
+    if snkr_url: 
+        report_lines.append(f"🔗 [查看 SNKRDUNK]({snkr_url})")
+        report_lines.append(f"🔗 [查看 SNKRDUNK 銷售歷史]({snkr_url}/sales-histories)")
+    
+    return "\n".join(report_lines)
+
+if __name__ == "__main__":
+    main()

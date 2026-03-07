@@ -1,0 +1,6 @@
+requests
+beautifulsoup4
+sqlite3
+asyncio
+lxml
+python-dotenv
