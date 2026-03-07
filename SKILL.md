@@ -1,32 +1,40 @@
-# SKILL: Market Arbitrage Monitor 📈
+---
+name: market-arbitrage-monitor
+description: Monitor Renaiss marketplace in real-time, comparing listings with PriceCharting/SNKRDUNK for arbitrage opportunities.
+---
 
-## Description
-This skill enables the AI agent to monitor the Renaiss marketplace in real-time and identify arbitrage opportunities by comparing current asking prices with 30-day historical averages from PriceCharting and SNKRDUNK.
+# Market Arbitrage Monitor 📈
 
-## Configuration (Adjustable)
-The monitor can be adjusted by the user or the AI agent through the following environment variables:
+This skill enables an AI agent to monitor the Renaiss marketplace and identify arbitrage opportunities by comparing current asking prices with historical averages from PriceCharting and SNKRDUNK.
 
-| Variable | Description | Default |
-| :--- | :--- | :--- |
-| `DISCORD_WEBHOOK_URL` | The URL for Discord notifications. | None |
-| `WINDOW_DAYS` | The time window (in days) used for historical averages. | `30` |
-| `PRICE_THRESHOLD` | The price difference ($ USD) required to trigger an alert. | `20.0` |
+## Prerequisites & Setup
+Before usage, the environment **MUST** be configured via a `.env` file (see `.env.example`):
 
-## Usage & Setup
-Before starting the monitor, you **MUST** configure the `.env` file:
+1. **Discord Setup**: `DISCORD_WEBHOOK_URL` is required for alerts.
+2. **Thresholds**: 
+   - `WINDOW_DAYS` (Default: 30): Rolling window for average price calculation.
+   - `PRICE_THRESHOLD` (Default: 20.0): Price difference (USD) to trigger an alert.
+3. **AI Vision (Optional)**: Set `MINIMAX_API_KEY` or `OPENAI_API_KEY` for card identification if titles are ambiguous.
 
-1.  **Initialize .env**: Run `cp .env.example .env` in the project root.
-2.  **Configure Webhook**: Open `.env` and fill in your `DISCORD_WEBHOOK_URL`.
-3.  **Adjust Thresholds (Optional)**:
-    - `WINDOW_DAYS`: Historical average window (Default: 30).
-    - `PRICE_THRESHOLD`: Min arbitrage profit (Default: 20.0).
-
-### Command
+### Quick Start
 ```bash
+# 1. Initialize environment
+cp .env.example .env
+
+# 2. Install dependencies
+pip install -r requirements.txt
+
+# 3. Launch monitor
 python3 market_monitor.py
 ```
 
-## Agent Capabilities
-- **Incremental Monitoring**: The monitor tracks seen items and only processes genuine NEW listings in subsequent cycles, protecting Jina API rate limits.
-- **Fast Response**: Polling interval is set to 1 minute to detect new listings rapidly.
-- **Status Reporting**: Read `market_monitor.log` or the startup output to know the current configuration.
+## Agent Capabilities & Logic
+- **Real-Time Analysis**: Direct scraping of PC and SNKR using Jina/BeautifulSoup.
+- **Incremental Scanning**: Tracks `SEEN_IDS` in memory; only analyzes genuine **NEW** listings to save API calls.
+- **30-Day Filtering**: Robust date parsing ensures averages reflect current market heat.
+- **Independent Alerts**: Triggers if **either** source shows a significant price gap.
+
+## Interaction Patterns
+- **Adjusting Rules**: Suggest the user to update `.env` or edit the "Manual Configuration" block in `market_monitor.py`.
+- **Status Checks**: Run `tail -f market_monitor.log` to observe real-time scanning activity.
+- **Troubleshooting**: If no prices are found, verify if the card title needs clarification via the Vision API.
