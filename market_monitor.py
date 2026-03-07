@@ -11,7 +11,103 @@ import market_report_vision as mrv
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Rename the parse function so it can be used standalone or from scrape_all_cards_db
+def parse_date_string(date_str):
+    """解析 PC 和 SNKR 的各種日期格式，返回 datetime 對象"""
+    now = datetime.now()
+    date_str = date_str.strip()
+    
+    # 1. 處理 YYYY-MM-DD (PC or SNKR)
+    try:
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', date_str):
+            return datetime.strptime(date_str, '%Y-%m-%d')
+        if re.match(r'^\d{4}/\d{2}/\d{2}$', date_str):
+            return datetime.strptime(date_str, '%Y/%m/%d')
+    except: pass
+    
+    # 2. 處理 Mar 8, 2024 (PC)
+    try:
+        if re.match(r'^[A-Z][a-z]{2}\s\d{1,2},\s\d{4}$', date_str):
+            return datetime.strptime(date_str, '%b %d, %Y')
+    except: pass
+    
+    # 3. 處理相對時間 (SNKRJP: 5 分前, 2 時間前, 3 日前)
+    m = re.match(r'^(\d+)\s*(分|時間|日)前$', date_str)
+    if m:
+        val = int(m.group(1))
+        unit = m.group(2)
+        if unit == '分': return now - timedelta(minutes=val)
+        if unit == '時間': return now - timedelta(hours=val)
+        if unit == '日': return now - timedelta(days=val)
+
+    # 4. 處理相對時間 (SNKREN: 5 minutes ago, 2 hours ago, 3 days ago)
+    m = re.search(r'(\d+)\s+(minute|hour|day)', date_str, re.IGNORECASE)
+    if m:
+        val = int(m.group(1))
+        unit = m.group(2).lower()
+        if unit == 'minute': return now - timedelta(minutes=val)
+        if unit == 'hour': return now - timedelta(hours=val)
+        if unit == 'day': return now - timedelta(days=val)
+        
+    return None
+
+def calculate_source_average(records, target_grade, window_days=30):
+    """計算特定來源在指定天數內的平均價（含等級匹配與誤差過濾）"""
+    if not records:
+        return None, 0
+    
+    now = datetime.now()
+    all_prices = []
+    
+    # 匹配等級（考慮 Unknown -> Ungraded）
+    snkr_target = target_grade.replace(" ", "")
+    
+    for r in records:
+        r_grade = r.get('grade', '')
+        # 建立匹配邏輯
+        matched = False
+        if r_grade == target_grade:
+            matched = True
+        elif target_grade == "Unknown" and r_grade in ("Ungraded", "裸卡", "A"):
+            matched = True
+        elif r_grade == snkr_target:
+            matched = True
+            
+        if not matched:
+            continue
+            
+        # 檢查日期窗口
+        d_str = r.get('date', '')
+        d_obj = parse_date_string(d_str)
+        if d_obj:
+            if now - d_obj > timedelta(days=window_days):
+                continue
+        elif d_str: # 如果有日期但解析失敗，預設保留（或可選擇略過）
+            pass
+            
+        # 提取價格
+        p = r.get('price')
+        if p and p > 0:
+            all_prices.append(float(p))
+            
+    if not all_prices:
+        return None, 0
+        
+    # IQR 過濾離群值 (至少 4 筆才過濾)
+    if len(all_prices) >= 4:
+        s_prices = sorted(all_prices)
+        n = len(s_prices)
+        q1 = s_prices[n // 4]
+        q3 = s_prices[(n * 3) // 4]
+        iqr = q3 - q1
+        lower = q1 - 1.5 * iqr
+        upper = q3 + 1.5 * iqr
+        filtered = [p for p in s_prices if lower <= p <= upper]
+        prices_to_use = filtered if filtered else s_prices
+    else:
+        prices_to_use = all_prices
+        
+    avg = sum(prices_to_use) / len(prices_to_use)
+    return avg, len(all_prices)
 def parse_renaiss_name(full_name):
     grade_m = re.search(r'(PSA|BGS|CGC|SGC)\s+(\d+(?:\.\d+)?)', full_name)
     grade_tag = f"{grade_m.group(1)} {grade_m.group(2)}" if grade_m else "Unknown"
@@ -91,63 +187,19 @@ def fetch_market_data():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 網路請求失敗: {e}")
         return []
 
-def calculate_true_average(pc_records, snkr_records, target_grade):
-    """從即時抓取的紀錄中計算該等級的歷史均價."""
-    all_prices = []
-    
-    # Process PC records
-    pc_matched = [r for r in (pc_records or []) if r.get('grade') == target_grade]
-    if not pc_matched and target_grade == "Unknown":
-        pc_matched = [r for r in (pc_records or []) if r.get('grade') == "Ungraded"]
-    
-    for r in pc_matched:
-        if r.get('price') and r['price'] > 0:
-            all_prices.append(float(r['price']))
-            
-    # Process SNKR records
-    snkr_target = target_grade.replace(" ", "")
-    snkr_matched = [r for r in (snkr_records or []) if r.get('grade') in (target_grade, snkr_target)]
-    if not snkr_matched and target_grade == "Unknown":
-        snkr_matched = snkr_records or []
-        
-    for r in snkr_matched:
-        if r.get('price') and r['price'] > 0:
-            all_prices.append(float(r['price']))
-            
-    if not all_prices:
-        return None, 0
-        
-    # Apply IQR filter
-    if len(all_prices) >= 4:
-        s_prices = sorted(all_prices)
-        n = len(s_prices)
-        q1 = s_prices[n // 4]
-        q3 = s_prices[(n * 3) // 4]
-        iqr = q3 - q1
-        lower = q1 - 1.5 * iqr
-        upper = q3 + 1.5 * iqr
-        filtered = [p for p in s_prices if lower <= p <= upper]
-        prices_to_use = filtered if filtered else s_prices
-    else:
-        prices_to_use = all_prices
-        
-    avg = sum(prices_to_use) / len(prices_to_use)
-    return avg, len(all_prices)
-
-
 def fetch_and_analyze_realtime(item_id, full_name, grading_company, year):
-    """現場發動爬蟲並分析價格"""
+    """現場發動爬蟲並分析價格 (分開回傳 PC 與 SNKR 的數據)"""
     print(f"  🔍 正在對 {full_name} 進行實時市場分析...")
     card_name, number, set_code, grade_tag = parse_renaiss_name(full_name)
     
-    # Category Detection
+    # 類別偵測
     category = "Pokemon"
     if any(kw in full_name or kw in (set_code or "") for kw in ["One Piece", "OP0", "ST0", "EB0", "WANTED", "Parallel", "Alt-Art"]):
         category = "One Piece"
     
     is_jp = "Japanese" in full_name
     
-    # Detect Variant Keywords
+    # 變體偵測
     variant_map = {
         "manga": ["コミパラ", "manga"],
         "parallel": ["パラレル"],
@@ -165,41 +217,50 @@ def fetch_and_analyze_realtime(item_id, full_name, grading_company, year):
             
     is_alt_art = len(snkr_variants) > 0 or any(x in name_lower for x in ["special card", "alt art", "alternative"])
     
-    # Perform Search
+    # 執行 PC 搜尋與計算
     pc_records, pc_url, _ = mrv.search_pricecharting(
         name=card_name, number=number, set_code=set_code,
         target_grade=grade_tag, is_alt_art=is_alt_art, category=category
     )
+    pc_avg, pc_count = calculate_source_average(pc_records, grade_tag, window_days=30)
+    
+    # 執行 SNKR 搜尋與計算
     snkr_records, _, snkr_url = mrv.search_snkrdunk(
         en_name=card_name, jp_name="", number=number, set_code=set_code,
         target_grade=grade_tag, is_alt_art=is_alt_art, card_language="JP" if is_jp else "EN",
         snkr_variant_kws=snkr_variants
     )
+    snkr_avg, snkr_count = calculate_source_average(snkr_records, grade_tag, window_days=30)
     
-    # Calculate Real-Time Average
-    true_avg, history_count = calculate_true_average(pc_records, snkr_records, grade_tag)
-    
-    return true_avg, history_count
+    return (pc_avg, pc_count, pc_url), (snkr_avg, snkr_count, snkr_url)
 
 
-def send_discord_alert(full_name, ask, avg, discount, history_count, pc_url, snkr_url):
-    """發送 Discord Webhook 通知"""
+def send_discord_alert(full_name, ask, pc_info, snkr_info):
+    """發送 Discord Webhook 通知 (含雙來源詳細數據)"""
     if not DISCORD_WEBHOOK_URL:
         return
+    
+    pc_avg, pc_count, pc_url = pc_info
+    snkr_avg, snkr_count, snkr_url = snkr_info
+
+    fields = [
+        {"name": "卡片名稱", "value": full_name, "inline": False},
+        {"name": "賣家開價", "value": f"${ask:.2f} USD", "inline": True},
+    ]
+    
+    if pc_avg:
+        fields.append({"name": "PC 30天均價", "value": f"${pc_avg:.2f} USD ({pc_count}筆)", "inline": True})
+    if snkr_avg:
+        fields.append({"name": "SNKR 30天均價", "value": f"${snkr_avg:.2f} USD ({snkr_count}筆)", "inline": True})
 
     payload = {
         "content": f"🚨 **[真正撿漏警報]** {full_name}",
         "embeds": [
             {
-                "title": f"撿漏機會：便宜了 {discount:.1f}%！",
+                "title": f"發現套利機會！(觸發門檻: $30)",
                 "color": 16711680,  # Red
-                "fields": [
-                    {"name": "卡片名稱", "value": full_name, "inline": False},
-                    {"name": "賣家開價", "value": f"${ask:.2f} USD", "inline": True},
-                    {"name": "市場均價", "value": f"${avg:.2f} USD", "inline": True},
-                    {"name": "成交紀錄數", "value": f"{history_count} 筆", "inline": True}
-                ],
-                "description": f"[🔗 PriceCharting]({pc_url})\n[🔗 SNKRDUNK]({snkr_url})"
+                "fields": fields,
+                "description": f"[🔗 PriceCharting]({pc_url or 'https://www.pricecharting.com'})\n[🔗 SNKRDUNK]({snkr_url or 'https://snkrdunk.com'})"
             }
         ]
     }
@@ -223,34 +284,37 @@ def run_monitor_cycle():
         item_id = item['item_id']
         ask = item['ask_price']
         full_name = item['name']
-        grade = item['grade']
         
-        # 1. 直接發動實時爬蟲 (不查資料庫舊價)
+        # 1. 直接發動實時爬蟲
         company = full_name.split()[0] if "PSA" in full_name or "BGS" in full_name else "Unknown"
         year_match = re.search(r'20\d{2}', full_name)
         year = year_match.group(0) if year_match else 0
         
-        true_avg, history_count = fetch_and_analyze_realtime(item_id, full_name, company, year)
+        pc_res, snkr_res = fetch_and_analyze_realtime(item_id, full_name, company, year)
+        pc_avg, pc_count, pc_url = pc_res
+        snkr_avg, snkr_count, snkr_url = snkr_res
         
-        # 2. 現場判斷折扣
-        if ask and true_avg and true_avg > 0 and history_count >= 1:
-            discount_pct = (1.0 - (ask / true_avg)) * 100
+        # 2. 獨立判斷折扣 (只要其中一個來源符合就報警)
+        alert_pc = (pc_avg and (pc_avg - ask) >= 30)
+        alert_snkr = (snkr_avg and (snkr_avg - ask) >= 30)
+        
+        # 日誌輸出
+        log_parts = []
+        if pc_avg: log_parts.append(f"PC(30d): ${pc_avg:.2f}")
+        if snkr_avg: log_parts.append(f"SNKR(30d): ${snkr_avg:.2f}")
+        print(f"  [掃描中] {full_name} | Ask: ${ask:.2f} | {' / '.join(log_parts) if log_parts else '無30天內數據'}")
+
+        if alert_pc or alert_snkr:
+            triggered_by = []
+            if alert_pc: triggered_by.append(f"PC(${(pc_avg-ask):.2f})")
+            if alert_snkr: triggered_by.append(f"SNKR(${(snkr_avg-ask):.2f})")
             
-            print(f"  [掃描中] {full_name} | Ask: ${ask:.2f} | Avg: ${true_avg:.2f} ({history_count}筆)")
+            print(f"\n🚨 [真正撿漏警報] {full_name}")
+            print(f"   => 賣家開價: ${ask:.2f} USD")
+            print(f"   🔥 觸發來源: {' & '.join(triggered_by)}！請立刻注意把這張卡買下來！\n")
             
-            price_diff = true_avg - ask
-            if price_diff >= 30:
-                print(f"\n🚨 [真正撿漏警報] {full_name}")
-                print(f"   => 賣家開價: ${ask:.2f} USD")
-                print(f"   => 實時市場均價: ${true_avg:.2f} USD (來自 {history_count} 筆歷史成交)")
-                print(f"   🔥 價差利潤: 便宜了 ${price_diff:.2f} USD！(門檻: $30) 請立刻注意把這張卡買下來！\n")
-                
-                # 發送 Discord Webhook
-                send_discord_alert(full_name, ask, true_avg, discount_pct, history_count, 
-                                   item.get('pc_url', 'https://www.pricecharting.com'), 
-                                   item.get('snkr_url', 'https://snkrdunk.com'))
-        elif ask:
-             print(f"  [無數據] {full_name} | Ask: ${ask:.2f} | 無市場成交紀錄")
+            # 發送 Discord Webhook
+            send_discord_alert(full_name, ask, pc_res, snkr_res)
 
 
 if __name__ == "__main__":
