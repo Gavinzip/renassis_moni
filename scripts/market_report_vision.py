@@ -489,6 +489,11 @@ def search_pricecharting(name, number, set_code, target_grade, is_alt_art, categ
         product_url = search_url
         _debug_step("PriceCharting", pc_step + 1, "", product_url,
                     "OK", reason="直接落在商品頁面，跳過 URL 篩選")
+                    
+        if return_candidates:
+            # If the main app expects candidate URLs, wrap the direct match as a candidate
+            return filter_pricecharting_candidates([f"{product_url} — {name}"]), None, None
+            
         records, resolved_url, pc_img_url = _fetch_pc_prices_from_url(product_url, md_content=md_content, target_grade=target_grade)
     
     return records, resolved_url, pc_img_url
@@ -524,6 +529,16 @@ def search_snkrdunk(en_name, jp_name, number, set_code, target_grade, is_alt_art
     if jp_name_query:
         if number_padded != "000":
             terms_to_try.append(f"{jp_name_query} {number_padded}")
+            
+    if not terms_to_try and number_padded != "000":
+        if jp_name_query:
+            terms_to_try.append(f"{jp_name_query} {number_padded}")
+        terms_to_try.append(f"{en_name_query} {number_padded}")
+        
+    if not terms_to_try:
+        if jp_name_query:
+            terms_to_try.append(jp_name_query)
+        terms_to_try.append(en_name_query)
     
     _debug_log(f"SNKRDUNK: 共 {len(terms_to_try)} 種查詢方案: {terms_to_try}")
 
