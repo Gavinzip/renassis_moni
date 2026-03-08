@@ -158,56 +158,38 @@ def parse_renaiss_name(full_name):
     if grade_m:
         clean_name = clean_name.replace(grade_m.group(0), "")
 
-    # Clean condition keywords
-    condition_kws = ["Gem Mint", "NM-MT", "Mint", "Near Mint", "Excellent", "Lightly Played", "Pristine", "Gem Mt", "GEM-MT", "MT", "NM", "EX-MT", "EX", "VG-EX", "VG", "Good", "Authentic"]
-    for kw in condition_kws:
-        clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE)
-
-    # Clean year
-    clean_name = re.sub(r'\b(19|20)\d{2}\b', '', clean_name)
-
-    # Clean noise words
-    noise_kws = ["Pokemon", "Japanese", "Simplified Chinese", "Traditional Chinese", "Chinese", "Asian", "Asia", "English", "Tef", "En-"]
-    for kw in noise_kws:
-        clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE)
-
-    # Clean variant keywords from name for better searching
-    variant_kws = ["FOIL", "SP", "ALT ART", "Parallel", "WANTED", "Leader", "SEC", "SR", "R", "UC", "C", "L", "Special Card", "Promo"]
-    for kw in variant_kws:
-        clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE)
-
-    # Extract number (either #183 or OP01-001 or 001/100)
+    # Look for '#<number>' pattern to split
+    m = re.search(r'#([-A-Za-z0-9]+)\s+(.*)', clean_name)
+    
+    character_name = ""
     number = "0"
     set_code = ""
 
-    op_m = re.search(r'([A-Z0-9]{2,}\d[A-Z]?)[-\s](\d+)', clean_name)
-    if op_m:
-        set_code = op_m.group(1)
-        number = op_m.group(2)
-        clean_name = clean_name.replace(op_m.group(0), "")
+    if m:
+        number = m.group(1)
+        character_name = m.group(2).strip()
+        before_hash = clean_name[:m.start()].strip()
+        
+        possible_sets = re.findall(r'\b([A-Za-z0-9]{2,}\d[A-Za-z]?)\b', before_hash)
+        possible_sets = [s for s in possible_sets if not re.match(r'^(19|20)\d{2}$', s)]
+        set_code = possible_sets[-1].upper() if possible_sets else ""
     else:
-        m = re.search(r'#([-A-Za-z0-9]+)', full_name) # match from original name just in case
-        if m:
-            number = m.group(1)
-            clean_name = clean_name.replace(f"#{number}", "")
+        # fallback for missing #
+        op_m = re.search(r'\b([A-Za-z0-9]{2,}\d[A-Za-z]?)[-\s](\d+)\s+(.*)', clean_name)
+        if op_m:
+            set_code = op_m.group(1).upper()
+            number = op_m.group(2)
+            character_name = op_m.group(3).strip()
         else:
-            m2 = re.search(r'\s+([A-Z0-9]{2,}/\d+)$', full_name)
-            if m2:
-                number = m2.group(1).split('/')[0]
-                clean_name = clean_name.replace(m2.group(1), "")
-
-    # Extract set_code if not found
-    if not set_code:
-        sc_m = re.search(r'([A-Za-z0-9]{2,}\d[A-Za-z]?)-', clean_name)
-        if sc_m:
-            set_code = sc_m.group(1)
-
-    # Final cleanup of spaces and dashes
-    clean_name = re.sub(r'\s+', ' ', clean_name).strip()
-    clean_name = re.sub(r'^\s*-\s*', '', clean_name).strip()
-    clean_name = re.sub(r'\s*-\s*$', '', clean_name).strip()
-
-    return clean_name, number, set_code.upper(), grade_tag
+            # worst case fallback
+            character_name = clean_name.strip()
+            
+    # Clean variant keywords from the character name just in case
+    variant_kws = ["FOIL", "SP", "ALT ART", "Parallel", "WANTED", "Leader", "SEC", "SR", "R", "UC", "C", "L", "Special Card", "Promo"]
+    for kw in variant_kws:
+        character_name = re.sub(rf'\b{re.escape(kw)}\b', '', character_name, flags=re.IGNORECASE).strip()
+        
+    return character_name, number, set_code, grade_tag
 
 
 def clean_price(v):
