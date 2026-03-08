@@ -20,7 +20,6 @@ load_dotenv(dotenv_path)
 DEFAULT_DISCORD_WEBHOOK = ""  # 在此填入 Webhook 網址
 DEFAULT_WINDOW_DAYS = 30                        # 價格計算窗口 (天)
 DEFAULT_PRICE_THRESHOLD = 20.0                  # 報警價差門檻 (USD)
-JPY_TO_USD_RATE = 150.0                         # 日幣對美金固定匯率 (用於 SNKRDUNK 換算)
 # ---------------------------------------------------------
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") or DEFAULT_DISCORD_WEBHOOK
@@ -163,6 +162,21 @@ def calculate_source_average(records, target_grade, window_days=30):
         
     avg = sum(prices_to_use) / len(prices_to_use)
     return avg, len(all_prices)
+
+def fetch_jpy_rate():
+    """實時獲取 美金對日圓(USD->JPY) 匯率"""
+    url = "https://open.er-api.com/v6/latest/USD"
+    try:
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            data = resp.json()
+            rate = data.get('rates', {}).get('JPY')
+            if rate:
+                return float(rate)
+    except Exception as e:
+        print(f"⚠️ 獲取實時匯率失敗 ({e})，使用預設值 150.0")
+    return 150.0
+
 def calculate_true_average_with_window(pc_records, snkr_records, target_grade):
     """(兼容舊版或輔助調用) 使用全局設定的天數計算均價"""
     pc_avg, pc_count = calculate_source_average(pc_records, target_grade, window_days=WINDOW_DAYS)
@@ -243,9 +257,9 @@ def fetch_market_data():
         print(f"[{datetime.now().strftime('%H:%M:%S')}] 網路請求失敗: {e}")
         return []
 
-def fetch_and_analyze_realtime(item_id, full_name, grading_company, year):
+def fetch_and_analyze_realtime(item_id, full_name, grading_company, year, current_jpy_rate=150.0):
     """現場發動爬蟲並分析價格 (分開回傳 PC 與 SNKR 的數據)"""
-    print(f"  🔍 正在對 {full_name} 進行實時市場分析...")
+    print(f"  🔍 正在對 {full_name} 進行實時市場分析... (匯率: 1 USD = {current_jpy_rate} JPY)")
     card_name, number, set_code, grade_tag = parse_renaiss_name(full_name)
     
     # 類別偵測
@@ -287,7 +301,7 @@ def fetch_and_analyze_realtime(item_id, full_name, grading_company, year):
         snkr_variant_kws=snkr_variants
     )
     snkr_avg_jpy, snkr_count = calculate_source_average(snkr_records, grade_tag, window_days=WINDOW_DAYS)
-    snkr_avg_usd = (snkr_avg_jpy / JPY_TO_USD_RATE) if snkr_avg_jpy else None
+    snkr_avg_usd = (snkr_avg_jpy / current_jpy_rate) if snkr_avg_jpy else None
     
     return (pc_avg, pc_count, pc_url), (snkr_avg_usd, snkr_count, snkr_url)
 
@@ -367,6 +381,7 @@ def run_monitor_cycle(limit=None, force_process=False, debug_dir=None):
         if not limit:
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 成功抓取 {len(items)} 筆掛單進行完全查價...")
     
+    current_jpy_rate = fetch_jpy_rate()
     whitelist = load_whitelist()
     
     for idx, item in enumerate(items, 1):
@@ -398,7 +413,7 @@ def run_monitor_cycle(limit=None, force_process=False, debug_dir=None):
         year_match = re.search(r'20\d{2}', full_name)
         year = year_match.group(0) if year_match else 0
         
-        pc_res, snkr_res = fetch_and_analyze_realtime(item_id, full_name, company, year)
+        pc_res, snkr_res = fetch_and_analyze_realtime(item_id, full_name, company, year, current_jpy_rate)
         pc_avg, pc_count, pc_url = pc_res
         snkr_avg, snkr_count, snkr_url = snkr_res
         
