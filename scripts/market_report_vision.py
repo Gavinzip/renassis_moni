@@ -376,12 +376,21 @@ def search_pricecharting(name, number, set_code, target_grade, is_alt_art, categ
         # Deduplicate while preserving order
         urls = list(dict.fromkeys(urls))
         
-        _debug_log(f"PriceCharting: 從搜尋頁面提取到 {len(urls)} 個候選 URL")
+        # 預先過濾分類，避免神奇的配對 (e.g. nintendo-power)
+        if is_one_piece:
+            urls = [u for u in urls if "one-piece" in u.lower()]
+        else:
+            urls = [u for u in urls if "pokemon" in u.lower()]
+            
+        _debug_log(f"PriceCharting: 從搜尋頁面提取並分類過濾後剩餘 {len(urls)} 個候選 URL")
         
         valid_urls = []
-        # 「名稱 slug」用純角色名（去掉括號內的版本描述，如 Leader Parallel / SP Foil 等）
+        # 「名稱 slug」用全小寫連字符，因為不依賴 AI 所以字串會很長 (包含系列名稱等)
         name_for_slug = re.sub(r'\(.*?\)', '', name).strip()
         name_slug = re.sub(r'[^a-zA-Z0-9]', '-', name_for_slug.lower()).strip('-')
+        # 去除連續的 - 以防出錯
+        name_slug = re.sub(r'-+', '-', name_slug)
+        
         # 編號的 0-padded 3位形式，修復 URL slug 內 026 不能被 26 regex 匹配的問題
         number_padded_pc = number_clean.zfill(3)
         # 航海王模式：set_code slug 用來做額外驗證 (e.g. "OP02" -> "op02")
@@ -395,6 +404,16 @@ def search_pricecharting(name, number, set_code, target_grade, is_alt_art, categ
         def _set_match(slug):
             """set_code 匹配：URL slug 含有 set_code 的核心字母數字部分"""
             return bool(set_code_slug) and set_code_slug in slug.replace('-', '')
+            
+        def _name_match(slug):
+            """名稱匹配：因為不依賴 AI，name_slug 非常長 (包含系列名+卡名)。
+            而 PriceCharting 的 slug 通常很短 (只有卡名)。
+            所以我們檢查 PC 的短 slug 是否被包含在我們的長 name_slug 中。"""
+            if not name_slug: return False
+            # 去除 slug 結尾的編號部位 (例如 charizard-vmax-134 -> charizard-vmax)
+            base_slug = re.sub(r'-\d+$', '', slug).strip('-')
+            # 或者是正向匹配
+            return (name_slug in slug) or (base_slug and base_slug in name_slug)
 
         matching_both = []   # 名稱 + 編號 (+ set_code for OP)
         matching_name = []   # 只有名稱 (+ set_code for OP)
@@ -407,7 +426,7 @@ def search_pricecharting(name, number, set_code, target_grade, is_alt_art, categ
                 # ── 航海王模式：必須包含 set_code，再依名稱/編號分級 ──
                 has_set = _set_match(u_end)
                 has_num = _num_match(u_end)
-                has_name = bool(name_slug) and name_slug in u_end
+                has_name = _name_match(u_end)
 
                 if has_name and has_num and has_set:
                     matching_both.append(u)
@@ -424,13 +443,16 @@ def search_pricecharting(name, number, set_code, target_grade, is_alt_art, categ
                 else:
                     _debug_log(f"  ❌ [OP] URL 不符合: {u}")
             else:
-                if name_slug and name_slug in u_end and _num_match(u_end):
+                has_num = _num_match(u_end)
+                has_name = _name_match(u_end)
+                
+                if has_name and has_num:
                     matching_both.append(u)
                     _debug_log(f"  ✅ [PKM] 名稱+編號: {u}")
-                elif name_slug and name_slug in u_end:
+                elif has_name:
                     matching_name.append(u)
                     _debug_log(f"  🔶 [PKM] 只符合名稱: {u}")
-                elif _num_match(u_end):
+                elif has_num:
                     matching_number.append(u)
                     _debug_log(f"  🔷 [PKM] 只符合編號 '{number_clean}'/'{number_padded_pc}': {u}")
                 else:

@@ -5,6 +5,7 @@ import time
 from datetime import datetime, timedelta
 import os
 import sys
+import argparse
 
 # Import search functions locally
 import market_report_vision as mrv
@@ -153,46 +154,60 @@ def parse_renaiss_name(full_name):
     grade_m = re.search(r'(PSA|BGS|CGC|SGC)\s+(\d+(?:\.\d+)?)', full_name)
     grade_tag = f"{grade_m.group(1)} {grade_m.group(2)}" if grade_m else "Unknown"
 
+    clean_name = full_name
+    if grade_m:
+        clean_name = clean_name.replace(grade_m.group(0), "")
+
+    # Clean condition keywords
+    condition_kws = ["Gem Mint", "NM-MT", "Mint", "Near Mint", "Excellent", "Lightly Played", "Pristine", "Gem Mt", "GEM-MT", "MT", "NM", "EX-MT", "EX", "VG-EX", "VG", "Good", "Authentic"]
+    for kw in condition_kws:
+        clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE)
+
+    # Clean year
+    clean_name = re.sub(r'\b(19|20)\d{2}\b', '', clean_name)
+
+    # Clean noise words
+    noise_kws = ["Pokemon", "Japanese", "Simplified Chinese", "Traditional Chinese", "Chinese", "Asian", "Asia", "English", "Tef", "En-"]
+    for kw in noise_kws:
+        clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE)
+
     # Clean variant keywords from name for better searching
-    variant_kws = ["FOIL", "SP", "ALT ART", "Parallel", "WANTED", "Leader", "SEC", "SR", "R", "UC", "C", "L", "Special Card"]
-    
-    # OP/ST pattern: OP01-001 or ST04-005 or OP01 001
-    op_m = re.search(r'([A-Z0-9]{2,}\d[A-Z]?)[-\s](\d+)', full_name)
+    variant_kws = ["FOIL", "SP", "ALT ART", "Parallel", "WANTED", "Leader", "SEC", "SR", "R", "UC", "C", "L", "Special Card", "Promo"]
+    for kw in variant_kws:
+        clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE)
+
+    # Extract number (either #183 or OP01-001 or 001/100)
+    number = "0"
+    set_code = ""
+
+    op_m = re.search(r'([A-Z0-9]{2,}\d[A-Z]?)[-\s](\d+)', clean_name)
     if op_m:
         set_code = op_m.group(1)
         number = op_m.group(2)
-        clean_name = full_name.replace(op_m.group(0), "").strip()
-        if grade_m:
-            clean_name = clean_name.replace(grade_m.group(0), "").strip()
-        
-        # Further clean name
-        for kw in variant_kws:
-            clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE).strip()
-            
-        return clean_name, number, set_code.upper(), grade_tag
+        clean_name = clean_name.replace(op_m.group(0), "")
+    else:
+        m = re.search(r'#([-A-Za-z0-9]+)', full_name) # match from original name just in case
+        if m:
+            number = m.group(1)
+            clean_name = clean_name.replace(f"#{number}", "")
+        else:
+            m2 = re.search(r'\s+([A-Z0-9]{2,}/\d+)$', full_name)
+            if m2:
+                number = m2.group(1).split('/')[0]
+                clean_name = clean_name.replace(m2.group(1), "")
 
-    m = re.search(r'#([-A-Za-z0-9]+)', full_name)
-    if not m:
-        m = re.search(r'\s+([A-Z0-9]{2,}/\d+)$', full_name)
-        if not m:
-            clean_name = full_name
-            if grade_m:
-                clean_name = clean_name.replace(grade_m.group(0), "").strip()
-            for kw in variant_kws:
-                clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE).strip()
-            return clean_name, "0", "", grade_tag
+    # Extract set_code if not found
+    if not set_code:
+        sc_m = re.search(r'([A-Za-z0-9]{2,}\d[A-Za-z]?)-', clean_name)
+        if sc_m:
+            set_code = sc_m.group(1)
 
-    number = m.group(1)
-    clean_name = full_name.replace(f"#{number}", "").strip()
-    if grade_m:
-        clean_name = clean_name.replace(grade_m.group(0), "").strip()
-    for kw in variant_kws:
-        clean_name = re.sub(rf'\b{re.escape(kw)}\b', '', clean_name, flags=re.IGNORECASE).strip()
+    # Final cleanup of spaces and dashes
+    clean_name = re.sub(r'\s+', ' ', clean_name).strip()
+    clean_name = re.sub(r'^\s*-\s*', '', clean_name).strip()
+    clean_name = re.sub(r'\s*-\s*$', '', clean_name).strip()
 
-    sc_m = re.search(r'([A-Za-z0-9]{2,}\d[A-Za-z]?)-', full_name)
-    set_code = sc_m.group(1) if sc_m else ""
-
-    return clean_name, number, set_code, grade_tag
+    return clean_name, number, set_code.upper(), grade_tag
 
 
 def clean_price(v):
@@ -314,11 +329,12 @@ def send_discord_alert(full_name, ask, pc_info, snkr_info):
 # LEGACY: background_idle_update removed for real-time focus
 
 
-def run_monitor_cycle(limit=None, force_process=False):
+def run_monitor_cycle(limit=None, force_process=False, debug_dir=None):
     """
     監控循環：
     - limit: 限制處理筆數 (用於啟動測試)
     - force_process: 是否忽略 SEEN_IDS 檢查 (用於啟動測試)
+    - debug_dir: 儲存 debug 紀錄的資料夾
     """
     items = fetch_market_data()
     if not items:
@@ -339,7 +355,14 @@ def run_monitor_cycle(limit=None, force_process=False):
         if not limit:
             print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 成功抓取 {len(items)} 筆掛單進行完全查價...")
     
-    for item in items:
+    for idx, item in enumerate(items, 1):
+        if debug_dir:
+            safe_name = re.sub(r'[^A-Za-z0-9_]', '_', item['name'])[:50]
+            item_debug_dir = os.path.join(debug_dir, f"{idx:02d}_{safe_name}")
+            os.makedirs(item_debug_dir, exist_ok=True)
+            import market_report_vision as mrv
+            mrv._set_debug_dir(item_debug_dir)
+
         item_id = item['item_id']
         ask = item['ask_price']
         full_name = item['name']
@@ -382,6 +405,14 @@ def run_monitor_cycle(limit=None, force_process=False):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Renaiss Market Monitor")
+    parser.add_argument("--debug", help="Enable debug mode and specify output directory for traces")
+    args = parser.parse_args()
+
+    if args.debug:
+        mrv._set_debug_dir(args.debug)
+        print(f"🛠️ Debug 模式已開啟，詳細搜尋日誌將儲存至: {args.debug}")
+
     print("啟動 Renaiss 極致「全實時」監控機器人 (現場抓取分析模式)...")
     print(f"⚙️  當前設定: 價差門檻=${PRICE_THRESHOLD} USD | 時間窗口={WINDOW_DAYS} 天")
     print(f"🔔  Discord 通知: {'已開啟' if DISCORD_WEBHOOK_URL else '未開啟 (請設定 DISCORD_WEBHOOK_URL)'}")
@@ -406,7 +437,7 @@ if __name__ == "__main__":
 
     # 🚀 初次啟動：強行針對前 5 筆進行實時分析測試
     try:
-        run_monitor_cycle(limit=5, force_process=True)
+        run_monitor_cycle(limit=5, force_process=True, debug_dir=args.debug)
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] 🏁 啟動測試完成，5 秒後進入 1 分鐘循環監控...", flush=True)
         time.sleep(5)
     except Exception as e:
@@ -415,7 +446,7 @@ if __name__ == "__main__":
     while True:
         try:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 🔃 正在掃描市場新掛單...", flush=True)
-            run_monitor_cycle()
+            run_monitor_cycle(debug_dir=args.debug)
         except Exception as e:
             print(f"Monitor Crash: {e}", flush=True)
 
